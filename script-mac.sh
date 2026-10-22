@@ -21,13 +21,19 @@ sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.pli
 sleep 3
 nc -z localhost 5900 && echo "VNC listening on 5900"
 
-# noVNC (browser VNC) + keyless cloudflared quick tunnel (HTTP)
-brew install cloudflared novnc websockify
+# cloudflared
+brew install cloudflared
 
-nohup websockify --web "$(brew --prefix novnc)/share/webapps/novnc" \
-  6080 localhost:5900 > ws.log 2>&1 &
+# noVNC (from GitHub) + websockify (from pip, in a venv)
+git clone --depth 1 --branch v1.5.0 https://github.com/novnc/noVNC.git "$HOME/noVNC"
+python3 -m venv "$HOME/wsvenv"
+"$HOME/wsvenv/bin/pip" install --quiet websockify
+
+nohup "$HOME/wsvenv/bin/websockify" --web "$HOME/noVNC" 6080 localhost:5900 > ws.log 2>&1 &
 sleep 2
+nc -z localhost 6080 && echo "websockify listening on 6080" || { cat ws.log; exit 1; }
 
+# Keyless cloudflared quick tunnel (HTTP)
 nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > cf.log 2>&1 &
 
 URL=""
