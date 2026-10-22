@@ -21,24 +21,25 @@ sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.pli
 sleep 3
 nc -z localhost 5900 && echo "VNC listening on 5900"
 
-# Keyless cloudflared quick tunnel (TCP)
-brew install cloudflared
-nohup cloudflared tunnel --no-autoupdate --url tcp://localhost:5900 > cf.log 2>&1 &
+# noVNC (browser VNC) + keyless cloudflared quick tunnel (HTTP)
+brew install cloudflared novnc websockify
 
-HOST=""
+nohup websockify --web "$(brew --prefix novnc)/share/webapps/novnc" \
+  6080 localhost:5900 > ws.log 2>&1 &
+sleep 2
+
+nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > cf.log 2>&1 &
+
+URL=""
 for _ in $(seq 1 30); do
-  HOST=$(grep -oE '[a-z0-9-]+\.trycloudflare\.com' cf.log | head -1 || true)
-  [ -n "$HOST" ] && break; sleep 2
+  URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' cf.log | head -1 || true)
+  [ -n "$URL" ] && break; sleep 2
 done
-[ -z "$HOST" ] && { cat cf.log; echo "Tunnel failed"; exit 1; }
+[ -z "$URL" ] && { cat cf.log; echo "Tunnel failed"; exit 1; }
 
 {
   echo "## VNC ready"
-  echo "On your machine, run:"
-  echo '```'
-  echo "cloudflared access tcp --hostname $HOST --url localhost:5900"
-  echo '```'
-  echo "Then connect Screen Sharing / any VNC client to localhost:5900"
-  echo "Apple Screen Sharing login: $VNC_USER / $VNC_USER_PASSWORD"
-  echo "Other VNC clients password: $VNC_PASSWORD"
+  echo "Open this in any browser (works on iPhone):"
+  echo "$URL/vnc.html?autoconnect=1"
+  echo "Password: $VNC_PASSWORD"
 } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
