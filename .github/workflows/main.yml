@@ -1,0 +1,29 @@
+name: mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner image
+        type: choice
+        default: macos-15
+        options: [macos-14, macos-15, macos-15-intel, macos-26]
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup VNC + cloudflared
+        env:
+          VNC_USER: ${{ secrets.VNC_USER }}
+          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: bash ./script-mac.sh
+
+      - name: Keep alive (~5.5h)
+        run: |
+          END=$(( $(date +%s) + 19800 ))
+          while [ "$(date +%s)" -lt "$END" ]; do sleep 60; done
