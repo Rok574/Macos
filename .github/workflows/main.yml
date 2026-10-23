@@ -7,7 +7,12 @@ on:
         description: Runner image
         type: choice
         default: macos-15
-        options: [macos-14, macos-15, macos-15-intel, macos-26]
+        options:
+          - macos-14
+          - macos-15
+          - macos-15-intel
+          - macos-26
+          - macos-27
 
 jobs:
   build:
