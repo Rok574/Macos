@@ -11,13 +11,24 @@ on:
         description: 'Device model (if the iOS version does not support it, an iPhone it does support is used)'
         default: 'iPhone 17 Pro'
         required: true
+      fps:
+        description: 'Target streaming FPS (higher uses more CPU and bandwidth)'
+        type: choice
+        options:
+          - '15'
+          - '24'
+          - '30'
+          - '45'
+          - '60'
+        default: '30'
+        required: true
       scale:
         description: 'Video scale factor (0.3 - 1.0). Lower = faster, blurrier.'
-        default: '0.5'
+        default: '0.35'
         required: true
       quality:
         description: 'JPEG quality (0.2 - 1.0). Lower = faster, blockier.'
-        default: '0.6'
+        default: '0.45'
         required: true
       audio:
         description: 'Stream simulator audio + microphone (installs virtual audio devices)'
@@ -37,6 +48,7 @@ jobs:
       VER: ${{ inputs.version }}
       DEVICE: ${{ inputs.device }}
       MINUTES: '340'
+      FPS: ${{ inputs.fps }}
       SCALE: ${{ inputs.scale }}
       QUALITY: ${{ inputs.quality }}
       AUDIO: ${{ inputs.audio }}
@@ -175,6 +187,8 @@ jobs:
         run: |
           if ! command -v dart >/dev/null; then
             brew tap dart-lang/dart
+            # Newer Homebrew versions require explicit trust for third-party taps.
+            brew trust --formula dart-lang/dart/dart || brew trust dart-lang/dart
             brew install dart
           fi
           dart pub global activate simpod
@@ -314,12 +328,12 @@ jobs:
           GRPC_PORT = int(os.environ.get("GRPC_PORT", "10882"))
           IDB = os.environ.get("IDB", "idb")
           FPS = os.environ.get("FPS", "30")
-          SCALE = os.environ.get("SCALE", "0.5")
-          QUALITY = os.environ.get("QUALITY", "0.6")
+          SCALE = os.environ.get("SCALE", "0.35")
+          QUALITY = os.environ.get("QUALITY", "0.45")
           SCALE_H = int(os.environ.get("SCALE_H", "1100"))
-          WINDOW = int(os.environ.get("WINDOW", "10"))
+          WINDOW = int(os.environ.get("WINDOW", "3"))
           STREAM = {"fps": FPS, "scale": SCALE, "quality": QUALITY, "gen": 0}
-          PRESETS = {"fast": ("20", "0.35", "0.45"), "balanced": ("30", "0.5", "0.6"), "sharp": ("30", "0.75", "0.8")}
+          PRESETS = {"fast": ("30", "0.3", "0.35"), "balanced": ("30", "0.5", "0.6"), "sharp": ("30", "0.75", "0.8")}
 
           FRAME = {"data": b"", "id": 0}
           MODE = {"v": "starting"}
@@ -821,12 +835,13 @@ jobs:
                       if STREAM["gen"] != gen:
                           return "restart"
                       try:
-                          chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=(3 if got else 20))
+                          chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=(8 if got else 20))
                       except asyncio.TimeoutError:
                           if not got:
                               log("no video frames within 20s")
                           else:
-                              log("idb video stream stalled: no bytes for 3s; switching to screenshot fallback")
+                              log("idb video stream stalled for 8s; restarting stream before considering screenshot fallback")
+                              return "restart"
                           return False
                       if not chunk:
                           log("idb video-stream ended")
@@ -892,13 +907,20 @@ jobs:
 
           async def capture():
               if shutil.which(IDB):
-                  while await stream_idb() == "restart":
-                      log("restarting video stream with new quality")
+                  restarts = 0
+                  while not STOP_EV.is_set():
+                      result = await stream_idb()
+                      if result == "restart":
+                          restarts += 1
+                          log("restarting idb video stream (attempt %d; keeping live-stream path)" % restarts)
+                          await asyncio.sleep(min(1.0 + restarts * 0.5, 4.0))
+                          continue
+                      break
                   if STOP_EV.is_set():
                       return
-                  log("idb stream unavailable, falling back")
+                  log("WARNING: idb MJPEG stream unavailable after retries; screenshot fallback will be low FPS")
               else:
-                  log("idb not installed, falling back")
+                  log("WARNING: idb not installed; screenshot fallback will be low FPS")
               await stream_screenshots()
 
 
@@ -910,7 +932,8 @@ jobs:
           async def index(request):
               if not authed(request):
                   return web.Response(status=403, text="forbidden")
-              resp = web.Response(text=PAGE, content_type="text/html", charset="utf-8")
+              page = PAGE.replace("__FPS__", FPS)
+              resp = web.Response(text=page, content_type="text/html", charset="utf-8")
               resp.set_cookie("k", TOKEN, path="/", httponly=True, secure=True, samesite="Lax")
               return resp
 
@@ -1567,16 +1590,16 @@ jobs:
                   </div>
                   <div class="card"><h3>Video stream</h3>
                     <div class="grid g3">
-                      <button class="sm" onclick="preset(20,0.35,0.45)">Fast</button>
+                      <button class="sm" onclick="preset(30,0.3,0.35)">Fast</button>
                       <button class="sm" onclick="preset(30,0.5,0.6)">Balanced</button>
                       <button class="sm" onclick="preset(30,0.75,0.8)">Sharp</button>
                     </div>
                     <label class="f">Frames per second <b id="st_fps_v">30</b></label>
-                    <input id="st_fps" type="range" min="5" max="60" value="30" oninput="sbv(this)">
-                    <label class="f">Size <b id="st_scale_v">0.5</b></label>
-                    <input id="st_scale" type="range" min="0.2" max="1" step="0.05" value="0.5" oninput="sbv(this)">
-                    <label class="f">Quality <b id="st_quality_v">0.6</b></label>
-                    <input id="st_quality" type="range" min="0.2" max="1" step="0.05" value="0.6" oninput="sbv(this)">
+                    <input id="st_fps" type="range" min="5" max="60" value="__FPS__" oninput="sbv(this)">
+                    <label class="f">Size <b id="st_scale_v">0.35</b></label>
+                    <input id="st_scale" type="range" min="0.2" max="1" step="0.05" value="0.35" oninput="sbv(this)">
+                    <label class="f">Quality <b id="st_quality_v">0.45</b></label>
+                    <input id="st_quality" type="range" min="0.2" max="1" step="0.05" value="0.45" oninput="sbv(this)">
                     <button class="primary" onclick="applyStream()">Apply</button>
                     <small>Lower values are faster but blurrier.</small>
                   </div>
@@ -1965,7 +1988,10 @@ jobs:
         run: |
           export TOKEN=$(openssl rand -hex 12)
           export PORT=8080
-          export FPS=30
+          export FPS="${FPS:-30}"
+          export SCALE="${SCALE:-0.35}"
+          export QUALITY="${QUALITY:-0.45}"
+          export WINDOW=3
           export GRPC_PORT=10882
 
           command -v cloudflared >/dev/null || { echo "cloudflared missing, cannot create the web link"; exit 1; }
