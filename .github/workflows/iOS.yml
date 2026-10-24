@@ -553,7 +553,8 @@ jobs:
                               a.extend([flag, str(v)])
 
                       tm = str(b.get("time", "")).strip()
-                      if re.match(r"^(\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?)$", tm):
+                      # simctl accepts a clock value like 9:41, not an ISO timestamp.
+                      if re.match(r"^(?:[0-9]|1\d|2[0-3]):[0-5]\d$", tm):
                           a.extend(["--time", tm])
                       op = str(b.get("op", "")).strip().lstrip("-")[:30]
                       if op:
@@ -797,12 +798,13 @@ jobs:
                       if STREAM["gen"] != gen:
                           return "restart"
                       try:
-                          chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=(1 if got else 20))
+                          chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=(3 if got else 20))
                       except asyncio.TimeoutError:
                           if not got:
                               log("no video frames within 20s")
-                              return False
-                          continue
+                          else:
+                              log("idb video stream stalled: no bytes for 3s; switching to screenshot fallback")
+                          return False
                       if not chunk:
                           log("idb video-stream ended")
                           return False
@@ -1593,38 +1595,22 @@ jobs:
           function gest(x1,y1,x2,y2,d){post('/swipe',{x1:x1,y1:y1,x2:x2,y2:y2,dur:d})}
           function sendText(){post('/text',{text:val('txt')});document.getElementById('txt').value=''}
 
-          // Track network frames separately from successfully decoded/rendered frames.
-          // This makes a zero-FPS symptom diagnosable instead of silently swallowing decode errors.
-          let pending=null,busy=false,frames=0,received=0,decodeErrors=0,lastT=performance.now();
+          let pending=null,busy=false,frames=0,lastT=performance.now();
           async function drain(){
             busy=true;
             while(pending){
               const b=pending;pending=null;
               try{
-                // The server sends raw JPEG bytes over WebSocket. Explicitly label them as JPEG
-                // before decoding so browsers don't have to infer the Blob's media type.
-                const jpeg = b instanceof Blob ? b : new Blob([b],{type:'image/jpeg'});
-                const bm=await createImageBitmap(jpeg);
+                const bm=await createImageBitmap(b);
                 if(cv.width!==bm.width||cv.height!==bm.height){cv.width=bm.width;cv.height=bm.height}
                 ctx.drawImage(bm,0,0);bm.close();
                 frames++;
-              }catch(e){
-                decodeErrors++;
-                if(decodeErrors===1)toast('Video frame decode failed: '+(e&&e.message?e.message:String(e)));
-              }
+              }catch(e){}
               ack();
             }
             busy=false;
           }
-          setInterval(()=>{
-            const n=performance.now(),dt=Math.max(1,n-lastT);
-            const renderFps=(frames*1000/dt).toFixed(1),recvFps=(received*1000/dt).toFixed(1);
-            fpsEl.textContent=renderFps+' fps · received '+recvFps;
-            if(received===0)fpsEl.title='No video frames received from server in the last second';
-            else if(frames===0)fpsEl.title='Frames are arriving, but none decoded/rendered. Decode errors: '+decodeErrors;
-            else fpsEl.title='Received frames: '+received+'; rendered frames: '+frames+'; decode errors: '+decodeErrors;
-            frames=0;received=0;lastT=n;
-          },1000);
+          setInterval(()=>{const n=performance.now();fpsEl.textContent=(frames*1000/(n-lastT)).toFixed(1)+' fps';frames=0;lastT=n},1000);
 
           function connect(){
             if(stopped||(ws&&ws.readyState<=1))return;
@@ -1637,7 +1623,6 @@ jobs:
                 else if(j.t==='stopped'){stopped=true;audioOff();micOff();toast('session stopped')}
                 return;
               }
-              received++;
               if(pending)ack();
               pending=e.data;
               if(!busy)drain();
@@ -1693,17 +1678,18 @@ jobs:
           const $=id=>document.getElementById(id);
           function sbv(el){$(el.id+'_v').textContent=el.value}
           function setv(id,v){$(id).value=v;if($(id+'_v'))$(id+'_v').textContent=v}
-          function isoNow(){const d=new Date(),p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}
+          // simctl status_bar --time requires a clock string such as 9:41, not an ISO timestamp.
+          function simTimeNow(){const d=new Date();return (d.getHours()%12||12)+':'+String(d.getMinutes()).padStart(2,'0')}
           let clockOn=true,lastTz='';
           function clockSync(){
             if(!clockOn||!ws||ws.readyState!==1)return;
             let tz='';try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone||''}catch(e){}
             if(tz&&tz!==lastTz){lastTz=tz;post('/tz',{name:tz})}
-            post('/statusbar',{mode:'set',time:isoNow()});
+            post('/statusbar',{mode:'set',time:simTimeNow()});
           }
           function toggleClock(){clockOn=!clockOn;lastTz='';$('clocksync').textContent='Clock and time zone from this device: '+(clockOn?'on':'off');if(clockOn)clockSync()}
           setInterval(clockSync,10000);
-          function sbVals(){return{mode:'set',time:clockOn?isoNow():val('sb_time'),op:val('sb_op'),cm:val('sb_cm'),cb:+val('sb_cb'),net:val('sb_net'),wm:val('sb_wm'),wb:+val('sb_wb'),bl:+val('sb_bl'),bs:val('sb_bs')}}
+          function sbVals(){return{mode:'set',time:clockOn?simTimeNow():val('sb_time'),op:val('sb_op'),cm:val('sb_cm'),cb:+val('sb_cb'),net:val('sb_net'),wm:val('sb_wm'),wb:+val('sb_wb'),bl:+val('sb_bl'),bs:val('sb_bs')}}
           function sbApply(){post('/statusbar',sbVals())}
           function applyStream(){post('/stream',{fps:+val('st_fps'),scale:+val('st_scale'),quality:+val('st_quality')})}
           function preset(f,s,q){setv('st_fps',f);setv('st_scale',s);setv('st_quality',q);applyStream()}
