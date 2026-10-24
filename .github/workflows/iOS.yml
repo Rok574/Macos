@@ -4,32 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'iOS version'
+        description: 'iOS version (if it is not available, the newest installed iOS is used)'
         default: '26.5'
         required: true
       device:
-        description: 'Simulator device name (exact). The log lists what the runtime supports.'
+        description: 'Device model (if the iOS version does not support it, an iPhone it does support is used)'
         default: 'iPhone 17 Pro'
-        required: true
-      minutes:
-        description: 'How long to keep the session alive (max ~340)'
-        default: '120'
-        required: true
-      scale:
-        description: 'Video scale factor (0.3 - 1.0). Lower = faster, blurrier.'
-        default: '0.5'
-        required: true
-      quality:
-        description: 'JPEG quality (0.2 - 1.0). Lower = faster, blockier.'
-        default: '0.6'
-        required: true
-      audio:
-        description: 'Stream simulator audio + microphone (installs virtual audio devices)'
-        type: boolean
-        default: true
-      timezone:
-        description: 'Time zone for the simulator (it follows the runner). Your phone updates it live once connected.'
-        default: 'America/New_York'
         required: true
 
 jobs:
@@ -40,11 +20,11 @@ jobs:
     env:
       VER: ${{ inputs.version }}
       DEVICE: ${{ inputs.device }}
-      MINUTES: ${{ inputs.minutes }}
-      SCALE: ${{ inputs.scale }}
-      QUALITY: ${{ inputs.quality }}
-      AUDIO: ${{ inputs.audio }}
-      TZNAME: ${{ inputs.timezone }}
+      MINUTES: '340'
+      SCALE: '0.5'
+      QUALITY: '0.6'
+      AUDIO: 'true'
+      TZNAME: 'America/New_York'
 
     steps:
       - name: Select newest installed Xcode
@@ -58,12 +38,11 @@ jobs:
           xcrun simctl list runtimes
           if ! xcrun simctl list runtimes | grep -q "iOS ${VER}"; then
             echo "Runtime not preinstalled, downloading (large, can take a while)..."
-            xcodebuild -downloadPlatform iOS -buildVersion "${VER}"
+            xcodebuild -downloadPlatform iOS -buildVersion "${VER}" || echo "Download failed, will use the newest installed iOS instead"
           fi
           xcrun simctl list runtimes
 
       - name: Install virtual audio device and route output to it
-        if: ${{ inputs.audio }}
         continue-on-error: true
         run: |
           brew install switchaudio-osx
@@ -86,7 +65,6 @@ jobs:
           date
 
       - name: Grant microphone and automation permissions
-        if: ${{ inputs.audio }}
         continue-on-error: true
         run: |
           csrutil status || true
@@ -121,8 +99,13 @@ jobs:
       - name: Create and boot the simulator
         run: |
           RT_ID=$(xcrun simctl list runtimes -j | jq -r --arg v "$VER" \
-            '[.runtimes[] | select(.platform=="iOS" and (.version|startswith($v)))][0].identifier // empty')
-          if [ -z "$RT_ID" ]; then echo "No iOS $VER runtime found"; exit 1; fi
+            '[.runtimes[] | select(.platform=="iOS" and .isAvailable==true and (.version|startswith($v)))][0].identifier // empty')
+          if [ -z "$RT_ID" ]; then
+            echo "iOS $VER is not available, using the newest installed iOS"
+            RT_ID=$(xcrun simctl list runtimes -j | jq -r \
+              '[.runtimes[] | select(.platform=="iOS" and .isAvailable==true)] | sort_by(.version | split(".") | map(tonumber? // 0)) | last | .identifier // empty')
+          fi
+          if [ -z "$RT_ID" ]; then echo "No iOS runtime is installed"; exit 1; fi
           echo "Runtime: $RT_ID"
           echo "Supported devices for this runtime:"
           xcrun simctl list runtimes -j | jq -r --arg id "$RT_ID" \
@@ -1993,8 +1976,12 @@ jobs:
 
           nohup python3 server.py > server.log 2>&1 &
           SERVER_PID=$!
-          sleep 4
-          curl -fsS "http://127.0.0.1:$PORT/?key=$TOKEN" -o /dev/null || { cat server.log; exit 1; }
+          for i in $(seq 1 90); do
+            curl -fsS "http://127.0.0.1:$PORT/?key=$TOKEN" -o /dev/null 2>/dev/null && break
+            kill -0 "$SERVER_PID" 2>/dev/null || { echo "server exited:"; cat server.log; exit 1; }
+            sleep 1
+          done
+          curl -fsS "http://127.0.0.1:$PORT/?key=$TOKEN" -o /dev/null || { echo "server not answering after 90s:"; cat server.log; exit 1; }
           tail -n +1 -f server.log &
 
           nohup cloudflared tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 > cf.log 2>&1 &
