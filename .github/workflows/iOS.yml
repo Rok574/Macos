@@ -1593,22 +1593,38 @@ jobs:
           function gest(x1,y1,x2,y2,d){post('/swipe',{x1:x1,y1:y1,x2:x2,y2:y2,dur:d})}
           function sendText(){post('/text',{text:val('txt')});document.getElementById('txt').value=''}
 
-          let pending=null,busy=false,frames=0,lastT=performance.now();
+          // Track network frames separately from successfully decoded/rendered frames.
+          // This makes a zero-FPS symptom diagnosable instead of silently swallowing decode errors.
+          let pending=null,busy=false,frames=0,received=0,decodeErrors=0,lastT=performance.now();
           async function drain(){
             busy=true;
             while(pending){
               const b=pending;pending=null;
               try{
-                const bm=await createImageBitmap(b);
+                // The server sends raw JPEG bytes over WebSocket. Explicitly label them as JPEG
+                // before decoding so browsers don't have to infer the Blob's media type.
+                const jpeg = b instanceof Blob ? b : new Blob([b],{type:'image/jpeg'});
+                const bm=await createImageBitmap(jpeg);
                 if(cv.width!==bm.width||cv.height!==bm.height){cv.width=bm.width;cv.height=bm.height}
                 ctx.drawImage(bm,0,0);bm.close();
                 frames++;
-              }catch(e){}
+              }catch(e){
+                decodeErrors++;
+                if(decodeErrors===1)toast('Video frame decode failed: '+(e&&e.message?e.message:String(e)));
+              }
               ack();
             }
             busy=false;
           }
-          setInterval(()=>{const n=performance.now();fpsEl.textContent=(frames*1000/(n-lastT)).toFixed(1)+' fps';frames=0;lastT=n},1000);
+          setInterval(()=>{
+            const n=performance.now(),dt=Math.max(1,n-lastT);
+            const renderFps=(frames*1000/dt).toFixed(1),recvFps=(received*1000/dt).toFixed(1);
+            fpsEl.textContent=renderFps+' fps · received '+recvFps;
+            if(received===0)fpsEl.title='No video frames received from server in the last second';
+            else if(frames===0)fpsEl.title='Frames are arriving, but none decoded/rendered. Decode errors: '+decodeErrors;
+            else fpsEl.title='Received frames: '+received+'; rendered frames: '+frames+'; decode errors: '+decodeErrors;
+            frames=0;received=0;lastT=n;
+          },1000);
 
           function connect(){
             if(stopped||(ws&&ws.readyState<=1))return;
@@ -1621,6 +1637,7 @@ jobs:
                 else if(j.t==='stopped'){stopped=true;audioOff();micOff();toast('session stopped')}
                 return;
               }
+              received++;
               if(pending)ack();
               pending=e.data;
               if(!busy)drain();
