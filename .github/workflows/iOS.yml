@@ -605,6 +605,8 @@ jobs:
 
           def handle(b):
               t = b.get("t")
+              if str(b.get("bundle", "")).startswith("dev.bridge"):
+                  return {"ok": False, "msg": "that is the internal button bridge, leave it running"}
               with LOCK:
                   if t == "tap":
                       W, H = points()
@@ -825,7 +827,8 @@ jobs:
                               got = True
                               MODE["v"] = "idb mjpeg stream"
                               log("first frame received; streaming via idb mjpeg")
-                          await publish(latest)
+                          if latest != FRAME["data"]:
+                              await publish(latest)
                   return True
               finally:
                   if proc.returncode is None:
@@ -1267,6 +1270,7 @@ jobs:
                   out.append({"id": bid,
                               "name": info.get("CFBundleDisplayName") or info.get("CFBundleName") or bid,
                               "user": info.get("ApplicationType") == "User"})
+              out = [a for a in out if not a["id"].startswith("dev.bridge")]
               out.sort(key=lambda a: (not a["user"], a["name"].lower()))
               return out
 
@@ -1399,6 +1403,7 @@ jobs:
                   <button data-tab="device">Device</button>
                   <button data-tab="status">Status bar</button>
                   <button data-tab="session">Session</button>
+                  <button data-tab="console" id="contab">Console</button>
                 </nav>
 
                 <div class="pane on" id="p-controls">
@@ -1522,6 +1527,13 @@ jobs:
                   <div class="grid g2"><button class="primary" onclick="sbApply()">Apply</button><button onclick="post('/statusbar',{mode:'clear'})">Reset</button></div>
                 </div>
 
+                <div class="pane" id="p-console">
+                  <div class="card"><h3>Console</h3>
+                    <div id="conlog" style="font:12px/1.5 ui-monospace,Menlo,monospace;max-height:60vh;overflow-y:auto;display:flex;flex-direction:column;gap:2px;word-break:break-word"><span class="muted">No messages yet.</span></div>
+                    <button class="sm" onclick="conClear()">Clear</button>
+                  </div>
+                </div>
+
                 <div class="pane" id="p-session">
                   <div class="card"><h3>Sound</h3>
                     <label class="f">Playback volume</label>
@@ -1559,7 +1571,20 @@ jobs:
           const ctx=cv.getContext('2d',{alpha:false,desynchronized:true});
           const tt=document.getElementById('toast'),fpsEl=document.getElementById('fps');
           function val(i){return document.getElementById(i).value}
-          let toastT;function toast(m){tt.textContent=m;tt.classList.add('show');clearTimeout(toastT);toastT=setTimeout(()=>tt.classList.remove('show'),3500)}
+          let conN=0,conUnread=0;
+          function toast(m){
+            const box=document.getElementById('conlog');
+            if(conN===0)box.textContent='';
+            conN++;
+            const d=new Date(),p=n=>String(n).padStart(2,'0');
+            const line=document.createElement('div');
+            line.textContent=p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())+'  '+m;
+            box.appendChild(line);
+            while(box.childNodes.length>200)box.removeChild(box.firstChild);
+            box.scrollTop=box.scrollHeight;
+            if(!document.getElementById('p-console').classList.contains('on')){conUnread++;document.getElementById('contab').textContent='Console ('+conUnread+')'}
+          }
+          function conClear(){const b=document.getElementById('conlog');b.textContent='';conN=0}
           let ws=null,stopped=false,retry=0;
           function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));else toast('not connected')}
           function ack(){if(ws&&ws.readyState===1)ws.send('{"t":"ack"}')}
@@ -1803,6 +1828,7 @@ jobs:
             document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('on',x===b));
             document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.id==='p-'+b.dataset.tab));
             if(b.dataset.tab==='apps')loadApps();
+            if(b.dataset.tab==='console'){conUnread=0;b.textContent='Console'}
           }));
 
           function el(tag,cls,txt){const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e}
