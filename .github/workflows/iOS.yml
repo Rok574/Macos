@@ -11,6 +11,22 @@ on:
         description: 'Device model (if the iOS version does not support it, an iPhone it does support is used)'
         default: 'iPhone 17 Pro'
         required: true
+      scale:
+        description: 'Video scale factor (0.3 - 1.0). Lower = faster, blurrier.'
+        default: '0.5'
+        required: true
+      quality:
+        description: 'JPEG quality (0.2 - 1.0). Lower = faster, blockier.'
+        default: '0.6'
+        required: true
+      audio:
+        description: 'Stream simulator audio + microphone (installs virtual audio devices)'
+        type: boolean
+        default: true
+      timezone:
+        description: 'Time zone for the simulator (it follows the runner). Your phone updates it live once connected.'
+        default: 'America/New_York'
+        required: true
 
 jobs:
   simulator:
@@ -21,10 +37,10 @@ jobs:
       VER: ${{ inputs.version }}
       DEVICE: ${{ inputs.device }}
       MINUTES: '340'
-      SCALE: '0.5'
-      QUALITY: '0.6'
-      AUDIO: 'true'
-      TZNAME: 'America/New_York'
+      SCALE: ${{ inputs.scale }}
+      QUALITY: ${{ inputs.quality }}
+      AUDIO: ${{ inputs.audio }}
+      TZNAME: ${{ inputs.timezone }}
 
     steps:
       - name: Select newest installed Xcode
@@ -43,6 +59,7 @@ jobs:
           xcrun simctl list runtimes
 
       - name: Install virtual audio device and route output to it
+        if: ${{ inputs.audio }}
         continue-on-error: true
         run: |
           brew install switchaudio-osx
@@ -65,6 +82,7 @@ jobs:
           date
 
       - name: Grant microphone and automation permissions
+        if: ${{ inputs.audio }}
         continue-on-error: true
         run: |
           csrutil status || true
@@ -253,7 +271,12 @@ jobs:
                           let c = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                           var result = "ok"
                           if c == "action" {
-                              device.press(.action)
+                              if device.hasHardwareButton(.action) {
+                                  device.press(.action)
+                                  result = "ok"
+                              } else {
+                                  result = "unsupported: selected simulator does not expose an Action Button; choose a supported iPhone model (for example, iPhone 17 Pro)"
+                              }
                           } else if c == "volume_up" {
                               result = self.setVolume(0.0625)
                           } else if c == "volume_down" {
@@ -1394,7 +1417,7 @@ jobs:
                   <button onclick="btn('LOCK')">Lock</button>
                   <button onclick="post('/simbtn',{name:'volume_down'})">Vol &minus;</button>
                   <button onclick="post('/simbtn',{name:'volume_up'})">Vol +</button>
-                  <button onclick="post('/simbtn',{name:'action'})">Action</button>
+                  <button title="Press the simulated iPhone Action Button" onclick="post('/simbtn',{name:'action'})">Action Button</button>
                   <button onclick="btn('SIRI')">Siri</button>
                 </div>
               </section>
@@ -1595,22 +1618,34 @@ jobs:
           function gest(x1,y1,x2,y2,d){post('/swipe',{x1:x1,y1:y1,x2:x2,y2:y2,dur:d})}
           function sendText(){post('/text',{text:val('txt')});document.getElementById('txt').value=''}
 
-          let pending=null,busy=false,frames=0,lastT=performance.now();
+          let pending=null,busy=false,frames=0,received=0,decodeErrors=0,lastT=performance.now();
           async function drain(){
             busy=true;
             while(pending){
               const b=pending;pending=null;
               try{
-                const bm=await createImageBitmap(b);
+                const jpeg = b instanceof Blob ? b : new Blob([b],{type:'image/jpeg'});
+                const bm=await createImageBitmap(jpeg);
                 if(cv.width!==bm.width||cv.height!==bm.height){cv.width=bm.width;cv.height=bm.height}
                 ctx.drawImage(bm,0,0);bm.close();
                 frames++;
-              }catch(e){}
+              }catch(e){
+                decodeErrors++;
+                if(decodeErrors===1)toast('Video frame decode failed: '+(e&&e.message?e.message:String(e)));
+              }
               ack();
             }
             busy=false;
           }
-          setInterval(()=>{const n=performance.now();fpsEl.textContent=(frames*1000/(n-lastT)).toFixed(1)+' fps';frames=0;lastT=n},1000);
+          setInterval(()=>{
+            const n=performance.now(),dt=Math.max(1,n-lastT);
+            const renderFps=(frames*1000/dt).toFixed(1),recvFps=(received*1000/dt).toFixed(1);
+            fpsEl.textContent=renderFps+' fps · received '+recvFps;
+            if(received===0)fpsEl.title='No video frames received from server in the last second';
+            else if(frames===0)fpsEl.title='Frames are arriving, but none decoded/rendered. Decode errors: '+decodeErrors;
+            else fpsEl.title='Received frames: '+received+'; rendered frames: '+frames+'; decode errors: '+decodeErrors;
+            frames=0;received=0;lastT=n;
+          },1000);
 
           function connect(){
             if(stopped||(ws&&ws.readyState<=1))return;
@@ -1623,6 +1658,7 @@ jobs:
                 else if(j.t==='stopped'){stopped=true;audioOff();micOff();toast('session stopped')}
                 return;
               }
+              received++;
               if(pending)ack();
               pending=e.data;
               if(!busy)drain();
