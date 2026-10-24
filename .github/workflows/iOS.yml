@@ -427,7 +427,7 @@ jobs:
 
 
           def bridge(cmd, wait=5.0):
-              for _ in range(40):
+              for _ in range(120):
                   if os.path.exists(BR_READY) or not os.path.exists(BR_RUNNING):
                       break
                   time.sleep(0.25)
@@ -1930,11 +1930,17 @@ jobs:
 
           if command -v idb_companion >/dev/null && command -v idb >/dev/null; then
             nohup idb_companion --udid "$UDID" --grpc-port "$GRPC_PORT" > companion.log 2>&1 &
-            sleep 6
-            idb connect localhost "$GRPC_PORT" || true
-            echo "--- idb self-test (failures here mean touch input won't work) ---"
-            idb ui tap 100 100 --udid "$UDID" || echo "idb tap FAILED"
-            idb ui button HOME --udid "$UDID" || echo "idb button FAILED"
+            for i in $(seq 1 40); do nc -z localhost "$GRPC_PORT" 2>/dev/null && break; sleep 1; done
+            if nc -z localhost "$GRPC_PORT" 2>/dev/null; then
+              echo "idb companion is listening"
+              idb connect localhost "$GRPC_PORT" || true
+              echo "--- idb self-test (failures here mean touch input won't work) ---"
+              perl -e 'alarm 20; exec @ARGV' idb ui tap 100 100 --udid "$UDID" || echo "idb tap FAILED"
+              perl -e 'alarm 20; exec @ARGV' idb ui button HOME --udid "$UDID" || echo "idb button FAILED"
+            else
+              echo "idb companion did not start in 40s:"
+              cat companion.log
+            fi
           else
             echo "idb / idb_companion missing: slow screenshot fallback, no touch input"
           fi
@@ -1945,8 +1951,10 @@ jobs:
           if [ -n "$XR" ]; then
             touch "$HOME/xcbtn.running"
             XR="$XR" UDID="$UDID" nohup bash -c 'while true; do xcodebuild test-without-building -xctestrun "$XR" -destination "id=$UDID" >> bridge.log 2>&1; rm -f "$HOME/xcbtn.ready"; sleep 2; done' > /dev/null 2>&1 &
-            for i in $(seq 1 45); do [ -f "$HOME/xcbtn.ready" ] && break; sleep 2; done
-            if [ -f "$HOME/xcbtn.ready" ]; then echo "button bridge ready"; else echo "button bridge NOT ready:"; tail -40 bridge.log; fi
+            (
+              for i in $(seq 1 120); do [ -f "$HOME/xcbtn.ready" ] && break; sleep 2; done
+              if [ -f "$HOME/xcbtn.ready" ]; then echo "button bridge ready"; else echo "button bridge NOT ready:"; tail -40 bridge.log; fi
+            ) &
           else
             echo "button bridge was not built: Action button / Ask Siri unavailable"
           fi
