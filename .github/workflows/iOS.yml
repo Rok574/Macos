@@ -1,4 +1,4 @@
-name: Remote iOS 26.5 Simulator
+name: Remote iOS 26.5 Simulator (idb only)
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ on:
       audio:
         description: 'Stream simulator audio + microphone'
         type: boolean
-        default: true
+        default: false
       timezone:
         description: 'Time zone'
         default: 'America/New_York'
@@ -22,17 +22,17 @@ on:
 
 jobs:
   simulator:
-    name: iOS ${{ inputs.version }} simulator
+    name: iOS ${{ inputs.version }} (idb)
     runs-on: macos-15
     timeout-minutes: 355
     env:
       VER: ${{ inputs.version }}
       DEVICE: ${{ inputs.device }}
       MINUTES: '340'
-      # Hard-coded good defaults (can still be changed live in the web UI)
-      FPS: '60'
-      SCALE: '0.45'
-      QUALITY: '0.50'
+      # Light defaults so idb actually starts producing frames
+      FPS: '24'
+      SCALE: '0.30'
+      QUALITY: '0.35'
       AUDIO: ${{ inputs.audio }}
       TZNAME: ${{ inputs.timezone }}
 
@@ -41,7 +41,7 @@ jobs:
         run: |
           XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
           if [ -z "$XC" ]; then
-            echo "No Xcode 26 found on this runner"
+            echo "No Xcode 26 found"
             ls /Applications/Xcode*.app || true
             exit 1
           fi
@@ -65,68 +65,51 @@ jobs:
           brew install switchaudio-osx
           brew install --cask blackhole-2ch blackhole-16ch
           sudo killall coreaudiod || true
-          sleep 3
-          for i in $(seq 1 30); do
-            SwitchAudioSource -a -t output | grep -q "BlackHole 2ch" && \
-            SwitchAudioSource -a -t input | grep -q "BlackHole 16ch" && break
-            sleep 1
-          done
+          sleep 2
           SwitchAudioSource -s "BlackHole 2ch" -t output || true
           SwitchAudioSource -s "BlackHole 16ch" -t input || true
-          echo "Output: $(SwitchAudioSource -c -t output)"
-          echo "Input:  $(SwitchAudioSource -c -t input)"
 
       - name: Set runner time zone
         continue-on-error: true
         run: |
-          sudo systemsetup -settimezone "$TZNAME" || sudo ln -sf "/var/db/timezone/zoneinfo/$TZNAME" /etc/localtime
+          sudo systemsetup -settimezone "$TZNAME" || true
           date
 
-      - name: Grant microphone + automation permissions
+      - name: Grant permissions
         if: ${{ inputs.audio }}
         continue-on-error: true
         run: |
           PYS=$(ls /Users/runner/hostedtoolcache/Python/*/*/bin/python3* 2>/dev/null | tr '\n' ' ')
           XC=$(xcode-select -p)
           APP="${XC%/Developer}"
-          CLIENTS_BID="com.apple.Terminal com.apple.dt.Xcode com.apple.CoreSimulator.CoreSimulatorService com.apple.iphonesimulator com.apple.dt.SimulatorTrampoline com.apple.dt.xcodebuild"
-          CLIENTS_PATH="/bin/bash /bin/zsh /bin/sh /usr/bin/python3 /usr/bin/osascript /usr/bin/xcrun /usr/bin/xcodebuild $APP/Contents/Developer/Applications/Simulator.app $APP/Contents/Developer/Applications/Simulator.app/Contents/MacOS/Simulator $(command -v python3 || true) $PYS"
+          CLIENTS_BID="com.apple.Terminal com.apple.dt.Xcode com.apple.CoreSimulator.CoreSimulatorService com.apple.iphonesimulator"
+          CLIENTS_PATH="/bin/bash /bin/zsh /usr/bin/python3 /usr/bin/xcrun $APP/Contents/Developer/Applications/Simulator.app $(command -v python3 || true) $PYS"
           add() {
             db="$1"; svc="$2"; client="$3"; ctype="$4"
             sudo sqlite3 "$db" "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier_type,indirect_object_identifier,flags,last_modified) VALUES ('$svc','$client',$ctype,2,4,1,0,'UNUSED',0,strftime('%s','now'));" 2>/dev/null || true
           }
           for db in "$HOME/Library/Application Support/com.apple.TCC/TCC.db" "/Library/Application Support/com.apple.TCC/TCC.db"; do
             [ -f "$db" ] || continue
-            for c in $CLIENTS_BID; do
-              add "$db" kTCCServiceMicrophone "$c" 0
-              add "$db" kTCCServiceAccessibility "$c" 0
-            done
-            for c in $CLIENTS_PATH; do
-              [ -n "$c" ] || continue
-              add "$db" kTCCServiceMicrophone "$c" 1
-              add "$db" kTCCServiceAccessibility "$c" 1
-            done
+            for c in $CLIENTS_BID; do add "$db" kTCCServiceMicrophone "$c" 0; done
+            for c in $CLIENTS_PATH; do [ -n "$c" ] && add "$db" kTCCServiceMicrophone "$c" 1; done
           done
           sudo killall tccd 2>/dev/null || true
-          sudo killall -9 com.apple.CoreSimulator.CoreSimulatorService 2>/dev/null || true
-          sleep 2
+          sleep 1
 
       - name: Create and boot the simulator
         run: |
           RT_ID=$(xcrun simctl list runtimes -j | jq -r --arg v "$VER" \
             '[.runtimes[] | select(.platform=="iOS" and .isAvailable==true and (.version|startswith($v)))][0].identifier // empty')
           if [ -z "$RT_ID" ]; then
-            echo "iOS $VER not available, using newest installed iOS"
             RT_ID=$(xcrun simctl list runtimes -j | jq -r \
               '[.runtimes[] | select(.platform=="iOS" and .isAvailable==true)] | sort_by(.version | split(".") | map(tonumber? // 0)) | last | .identifier // empty')
           fi
-          [ -n "$RT_ID" ] || { echo "No iOS runtime installed"; exit 1; }
+          [ -n "$RT_ID" ] || { echo "No iOS runtime"; exit 1; }
           echo "Runtime: $RT_ID"
 
           DT=$(xcrun simctl list runtimes -j | jq -r --arg id "$RT_ID" --arg n "$DEVICE" \
             '[.runtimes[] | select(.identifier==$id) | .supportedDeviceTypes[] | select(.name==$n)][0].identifier // empty')
           if [ -z "$DT" ]; then
-            echo "Device '$DEVICE' not supported, falling back to first iPhone"
             DT=$(xcrun simctl list runtimes -j | jq -r --arg id "$RT_ID" \
               '[.runtimes[] | select(.identifier==$id) | .supportedDeviceTypes[] | select(.productFamily=="iPhone")][0].identifier')
           fi
@@ -135,17 +118,17 @@ jobs:
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
           xcrun simctl privacy "$UDID" grant microphone || true
-          xcrun simctl privacy "$UDID" grant siri || true
           xcrun simctl privacy "$UDID" grant location || true
-          # Real location (San Francisco by default)
           xcrun simctl location "$UDID" set 37.7749,-122.4194 || true
+          # Help Xcode 26 performance
+          xcrun simctl ui "$UDID" appearance light || true
           xcrun simctl list devices | grep "$UDID"
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install cloudflared + idb + audio tools
+      - name: Install tools
         run: |
           brew install cloudflared
           brew tap facebook/fb
@@ -153,9 +136,8 @@ jobs:
           brew install idb-companion
           pip install fb-idb aiohttp sounddevice
           idb --help | head -2
-          cloudflared --version
 
-      - name: Install simpod (volume + rotation)
+      - name: Install simpod
         continue-on-error: true
         run: |
           if ! command -v dart >/dev/null; then
@@ -166,7 +148,7 @@ jobs:
           dart pub global activate simpod
           echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
 
-      - name: Build XCUITest button bridge
+      - name: Build button bridge
         continue-on-error: true
         run: |
           brew install xcodegen
@@ -253,11 +235,8 @@ jobs:
                           let c = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                           var result = "ok"
                           if c == "action" {
-                              if device.hasHardwareButton(.action) {
-                                  device.press(.action)
-                              } else {
-                                  result = "unsupported Action Button"
-                              }
+                              if device.hasHardwareButton(.action) { device.press(.action) }
+                              else { result = "unsupported Action Button" }
                           } else if c == "volume_up" {
                               result = self.setVolume(0.0625)
                           } else if c == "volume_down" {
@@ -277,10 +256,10 @@ jobs:
           xcodegen generate
           xcodebuild build-for-testing -project Bridge.xcodeproj -scheme Bridge \
             -destination "generic/platform=iOS Simulator" -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO 2>&1 | tail -20
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO 2>&1 | tail -15
           ls build/Build/Products/*.xctestrun || true
 
-      - name: Write the web server
+      - name: Write the web server (idb only)
         run: |
           cat > server.py <<'PYEOF'
           import asyncio, hmac, json, logging, os, re, shutil, subprocess, sys, tempfile, threading, time
@@ -294,11 +273,10 @@ jobs:
           PORT = int(os.environ.get("PORT", "8080"))
           GRPC_PORT = int(os.environ.get("GRPC_PORT", "10882"))
           IDB = os.environ.get("IDB", "idb")
-          FPS = os.environ.get("FPS", "60")
-          SCALE = os.environ.get("SCALE", "0.45")
-          QUALITY = os.environ.get("QUALITY", "0.50")
-          SCALE_H = int(os.environ.get("SCALE_H", "800"))
-          WINDOW = int(os.environ.get("WINDOW", "4"))
+          FPS = os.environ.get("FPS", "24")
+          SCALE = os.environ.get("SCALE", "0.30")
+          QUALITY = os.environ.get("QUALITY", "0.35")
+          WINDOW = 3
           STREAM = {"fps": FPS, "scale": SCALE, "quality": QUALITY, "gen": 0}
 
           FRAME = {"data": b"", "id": 0}
@@ -349,17 +327,14 @@ jobs:
 
           def volume(name):
               short = name.replace("_", "-")
-              last = None
               for a in (["button", name], ["button", short], [short], [name]):
                   r = simpod(a)
                   if r["ok"]:
                       return {"ok": True, "msg": "volume via simpod"}
-                  last = r
               r = bridge(name, wait=10.0)
               if r is not None:
                   return {"ok": r["ok"], "msg": ("volume via Control Center" if r["ok"] else r["msg"])}
-              r = idb(["ui", "key", "128" if name == "volume_up" else "129"])
-              return {"ok": r["ok"], "msg": "volume: keyboard key only"}
+              return idb(["ui", "key", "128" if name == "volume_up" else "129"])
 
           def simpod(args):
               r = run([SIMPOD] + args + ["-d", UDID])
@@ -527,1168 +502,3 @@ jobs:
                   log("live touch stream open")
                   try:
                       await NATIVE["c"].hid(gen())
-                  except Exception as e:
-                      log("live touch stream restarting:", repr(e))
-                  NATIVE["hid"] = False
-                  await asyncio.sleep(0.5)
-
-          def touch(b, st):
-              t = b.get("t")
-              try:
-                  fx = min(1.0, max(0.0, float(b["x"])))
-                  fy = min(1.0, max(0.0, float(b["y"])))
-              except Exception:
-                  return
-              pid = b.get("id", 0)
-              if t == "td":
-                  st.setdefault("starts", {})[pid] = (fx, fy, time.time())
-              ev = NATIVE.get("ev")
-              if ev and NATIVE.get("hid") and POINTS["v"]:
-                  W, H = POINTS["v"]
-                  if t == "tm" and HQ.qsize() > 12:
-                      return
-                  press, tch, direction, point = ev
-                  HQ.put_nowait(press(tch(point(fx * W, fy * H)), direction.UP if t == "tu" else direction.DOWN))
-                  return
-              if not POINTS["v"]:
-                  th = asyncio.create_task(asyncio.to_thread(points))
-                  BG.add(th)
-                  th.add_done_callback(BG.discard)
-              if t != "tu":
-                  return
-              starts = st.get("starts", {})
-              if pid not in starts:
-                  return
-              sx, sy, t0 = starts.pop(pid)
-              if abs(fx - sx) + abs(fy - sy) < 0.02:
-                  req = {"t": "tap", "x": fx, "y": fy, "dur": 0}
-              else:
-                  req = {"t": "swipe", "x1": sx, "y1": sy, "x2": fx, "y2": fy,
-                         "dur": max(0.08, min(time.time() - t0, 0.5))}
-              th = asyncio.create_task(handle_async(req))
-              BG.add(th)
-              th.add_done_callback(BG.discard)
-
-          async def init_native():
-              try:
-                  from idb.common.types import TCPAddress, HIDButtonType
-                  from idb.grpc.client import Client
-                  stack = AsyncExitStack()
-                  client = await stack.enter_async_context(Client.build(
-                      address=TCPAddress(host="localhost", port=GRPC_PORT),
-                      logger=logging.getLogger("idb")))
-                  NATIVE["c"] = client
-                  NATIVE["btn"] = HIDButtonType
-                  NATIVE["stack"] = stack
-                  log("native idb client connected")
-              except Exception as e:
-                  log("native idb client unavailable:", repr(e))
-
-          async def handle_async(b):
-              t = b.get("t")
-              if t == "installurl":
-                  return await asyncio.get_running_loop().run_in_executor(POOL, install_url, b)
-              async with INPUT_LOCK:
-                  c = NATIVE["c"]
-                  if c and t in ("tap", "swipe", "button", "text", "key"):
-                      try:
-                          if t in ("tap", "swipe"):
-                              W, H = POINTS["v"] or await asyncio.to_thread(points)
-                          if t == "tap":
-                              d = float(b.get("dur", 0) or 0)
-                              await c.tap(round(b["x"] * W), round(b["y"] * H), d if d > 0 else None)
-                          elif t == "swipe":
-                              await c.swipe((round(b["x1"] * W), round(b["y1"] * H)),
-                                            (round(b["x2"] * W), round(b["y2"] * H)),
-                                            duration=float(b.get("dur", 0.3)))
-                          elif t == "button":
-                              name = b.get("name", "")
-                              if name not in BUTTONS:
-                                  return {"ok": False, "msg": "bad button"}
-                              await c.button(getattr(NATIVE["btn"], name), 1.0 if name == "SIRI" else None)
-                          elif t == "text":
-                              await c.text(str(b.get("text", "")))
-                          elif t == "key":
-                              await c.key(int(b["code"]))
-                          return {"ok": True, "msg": "ok"}
-                      except Exception as e:
-                          log("native input failed, falling back:", repr(e))
-                  return await asyncio.get_running_loop().run_in_executor(POOL, handle, b)
-
-          async def publish(data):
-              async with COND:
-                  FRAME["data"] = data
-                  FRAME["id"] += 1
-                  COND.notify_all()
-
-          async def log_stderr(proc):
-              try:
-                  while True:
-                      line = await proc.stderr.readline()
-                      if not line:
-                          return
-                      log("[idb video-stream]", line.decode(errors="replace").rstrip())
-              except Exception:
-                  pass
-
-          async def stream_idb():
-              gen = STREAM["gen"]
-              cmd = [IDB, "video-stream", "--fps", STREAM["fps"], "--format", "mjpeg",
-                     "--compression-quality", STREAM["quality"], "--scale-factor", STREAM["scale"], "--udid", UDID]
-              log("starting idb stream:", " ".join(cmd))
-              proc = await asyncio.create_subprocess_exec(
-                  *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-              asyncio.create_task(log_stderr(proc))
-              buf = bytearray()
-              got = False
-              try:
-                  while not STOP_EV.is_set():
-                      if STREAM["gen"] != gen:
-                          return "restart"
-                      try:
-                          chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=(6 if got else 15))
-                      except asyncio.TimeoutError:
-                          if not got:
-                              log("no video frames within 15s — idb stream failed")
-                          else:
-                              log("idb stream stalled, restarting")
-                              return "restart"
-                          return False
-                      if not chunk:
-                          log("idb video-stream ended")
-                          return False
-                      buf += chunk
-                      latest = None
-                      while True:
-                          soi = buf.find(b"\xff\xd8")
-                          if soi < 0:
-                              buf.clear()
-                              break
-                          eoi = buf.find(b"\xff\xd9", soi + 2)
-                          if eoi < 0:
-                              if soi > 0:
-                                  del buf[:soi]
-                              break
-                          latest = bytes(buf[soi:eoi + 2])
-                          del buf[:eoi + 2]
-                      if len(buf) > 15_000_000:
-                          buf.clear()
-                      if latest:
-                          if not got:
-                              got = True
-                              MODE["v"] = "idb mjpeg"
-                              log("first frame received — streaming via idb")
-                          if latest != FRAME["data"]:
-                              await publish(latest)
-                  return True
-              finally:
-                  if proc.returncode is None:
-                      proc.kill()
-
-          async def stream_screenshots():
-              MODE["v"] = "screenshot fallback (slow)"
-              log("WARNING: using slow screenshot fallback")
-              tmp = tempfile.gettempdir()
-              raw = os.path.join(tmp, "sim_raw.jpg")
-              small = os.path.join(tmp, "sim_small.jpg")
-              while not STOP_EV.is_set():
-                  t = time.time()
-                  p = await asyncio.create_subprocess_exec(
-                      "xcrun", "simctl", "io", UDID, "screenshot", "--type=jpeg", raw,
-                      stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                  if await p.wait() == 0:
-                      src = raw
-                      if SCALE_H > 0:
-                          s = await asyncio.create_subprocess_exec(
-                              "sips", "--resampleHeight", str(SCALE_H), "-s", "formatOptions", "45",
-                              raw, "--out", small,
-                              stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                          if await s.wait() == 0:
-                              src = small
-                      try:
-                          data = await asyncio.to_thread(lambda: open(src, "rb").read())
-                          await publish(data)
-                      except Exception:
-                          pass
-                  dt = time.time() - t
-                  if dt < 0.05:
-                      await asyncio.sleep(0.05 - dt)
-
-          async def capture():
-              if shutil.which(IDB):
-                  restarts = 0
-                  while not STOP_EV.is_set():
-                      result = await stream_idb()
-                      if result == "restart":
-                          restarts += 1
-                          log("restarting idb video stream (attempt %d)" % restarts)
-                          await asyncio.sleep(min(0.8 + restarts * 0.4, 3.0))
-                          continue
-                      break
-                  if STOP_EV.is_set():
-                      return
-                  log("idb MJPEG unavailable after retries → screenshot fallback")
-              else:
-                  log("idb not installed → screenshot fallback")
-              await stream_screenshots()
-
-          def authed(request):
-              cands = [request.query.get("key", ""), request.cookies.get("k", "")]
-              return any(c and hmac.compare_digest(c.encode(), TOKEN.encode()) for c in cands)
-
-          async def index(request):
-              if not authed(request):
-                  return web.Response(status=403, text="forbidden")
-              page = PAGE.replace("__FPS__", FPS).replace("__SCALE__", SCALE).replace("__QUALITY__", QUALITY)
-              resp = web.Response(text=page, content_type="text/html", charset="utf-8")
-              resp.set_cookie("k", TOKEN, path="/", httponly=True, secure=True, samesite="Lax")
-              return resp
-
-          async def shot(request):
-              if not authed(request):
-                  return web.Response(status=403, text="forbidden")
-              p = os.path.join(tempfile.gettempdir(), "shot.png")
-              r = await asyncio.to_thread(
-                  subprocess.run, ["xcrun", "simctl", "io", UDID, "screenshot", p], capture_output=True)
-              if r.returncode != 0:
-                  return web.Response(status=500, text="screenshot failed")
-              data = await asyncio.to_thread(lambda: open(p, "rb").read())
-              return web.Response(body=data, content_type="image/png",
-                                  headers={"Content-Disposition": "attachment; filename=simulator.png"})
-
-          async def sender(ws, st):
-              last = 0
-              while not ws.closed:
-                  while st["inflight"] >= WINDOW and not ws.closed:
-                      try:
-                          await asyncio.wait_for(st["ack"].wait(), 2.5)
-                      except asyncio.TimeoutError:
-                          st["inflight"] = 0
-                      st["ack"].clear()
-                  async with COND:
-                      await COND.wait_for(lambda: FRAME["id"] > last or STOP_EV.is_set())
-                      data, last = FRAME["data"], FRAME["id"]
-                  if STOP_EV.is_set():
-                      await ws.send_json({"t": "stopped"})
-                      return
-                  st["inflight"] += 1
-                  await ws.send_bytes(data)
-
-          async def ws_handler(request):
-              if not authed(request):
-                  return web.Response(status=403, text="forbidden")
-              ws = web.WebSocketResponse(heartbeat=20, compress=False, max_msg_size=1 << 20)
-              await ws.prepare(request)
-              await ws.send_json({"t": "toast", "msg": "video: " + MODE["v"]})
-              st = {"inflight": 0, "ack": asyncio.Event(), "starts": {}}
-              task = asyncio.create_task(sender(ws, st))
-
-              async def do_input(b):
-                  try:
-                      res = await handle_async(b)
-                  except Exception as e:
-                      res = {"ok": False, "msg": "error: %s" % e}
-                  msg = res.get("msg", "ok")
-                  if not ws.closed and (not res.get("ok", True) or msg != "ok"):
-                      await ws.send_json({"t": "toast", "msg": msg})
-
-              try:
-                  async for msg in ws:
-                      if msg.type != WSMsgType.TEXT:
-                          continue
-                      try:
-                          b = json.loads(msg.data)
-                      except Exception:
-                          continue
-                      t = b.get("t")
-                      if t == "ack":
-                          st["inflight"] = max(0, st["inflight"] - 1)
-                          st["ack"].set()
-                          continue
-                      if t == "stream":
-                          try:
-                              f = max(15, min(60, int(b["fps"])))
-                              s = max(0.25, min(1.0, float(b["scale"])))
-                              q = max(0.3, min(1.0, float(b["quality"])))
-                              STREAM.update(fps=str(f), scale=str(s), quality=str(q))
-                              STREAM["gen"] += 1
-                              await ws.send_json({"t": "toast", "msg": "stream: %d fps · scale %.2f · q %.2f" % (f, s, q)})
-                          except Exception:
-                              await ws.send_json({"t": "toast", "msg": "bad stream settings"})
-                          continue
-                      if t in ("td", "tm", "tu"):
-                          touch(b, st)
-                          continue
-                      if t == "stop":
-                          STOP_EV.set()
-                          async with COND:
-                              COND.notify_all()
-                          continue
-                      th = asyncio.create_task(do_input(b))
-                      BG.add(th)
-                      th.add_done_callback(BG.discard)
-              finally:
-                  task.cancel()
-              return ws
-
-          def audio_broadcast(data):
-              if not AUDIO_CLIENTS:
-                  return
-              if data.count(0) == len(data):
-                  return
-              for q in list(AUDIO_CLIENTS):
-                  if q.full():
-                      try:
-                          q.get_nowait()
-                      except asyncio.QueueEmpty:
-                          pass
-                  q.put_nowait(data)
-
-          def start_audio(loop):
-              if os.environ.get("AUDIO", "true").lower() == "false":
-                  log("audio disabled by input")
-                  return
-              try:
-                  import audioop
-                  import sounddevice as sd
-              except Exception as e:
-                  log("audio import failed:", repr(e))
-                  return
-              try:
-                  idx = None
-                  for i, d in enumerate(sd.query_devices()):
-                      if AUDIO_DEVICE.lower() in d["name"].lower() and d["max_input_channels"] > 0:
-                          idx = i
-                          break
-                  if idx is None:
-                      log("audio device '%s' not found. Available devices:" % AUDIO_DEVICE)
-                      log(sd.query_devices())
-                      return
-                  info = sd.query_devices(idx)
-                  src_rate = int(info["default_samplerate"])
-                  src_ch = max(1, min(2, int(info["max_input_channels"])))
-                  out_ch = 1
-                  state = [None]
-                  stats = {"n": 0}
-
-                  def cb(indata, frames, tinfo, status):
-                      raw = bytes(indata)
-                      ch = src_ch
-                      if src_ch == 2 and out_ch == 1:
-                          raw = audioop.tomono(raw, 2, 0.5, 0.5)
-                          ch = 1
-                      if src_rate != AUDIO_RATE:
-                          raw, state[0] = audioop.ratecv(raw, 2, ch, src_rate, AUDIO_RATE, state[0])
-                      stats["n"] += 1
-                      if stats["n"] == 1:
-                          loop.call_soon_threadsafe(log, "audio capture started")
-                      loop.call_soon_threadsafe(audio_broadcast, raw)
-
-                  stream = sd.RawInputStream(device=idx, samplerate=src_rate, channels=src_ch,
-                                             dtype="int16", blocksize=src_rate // 40, callback=cb)
-                  stream.start()
-                  AUDIO.update(ok=True, ch=out_ch, stream=stream)
-                  log("audio OK: %s %d Hz → %d Hz mono" % (info["name"], src_rate, AUDIO_RATE))
-              except Exception as e:
-                  log("audio capture failed:", repr(e))
-
-          async def ws_audio(request):
-              if not authed(request):
-                  return web.Response(status=403, text="forbidden")
-              ws = web.WebSocketResponse(heartbeat=20, compress=False)
-              await ws.prepare(request)
-              await ws.send_json({"t": "fmt", "ok": AUDIO["ok"], "rate": AUDIO_RATE, "ch": AUDIO["ch"]})
-              q = asyncio.Queue(maxsize=20)
-              AUDIO_CLIENTS.add(q)
-
-              async def pump():
-                  while not ws.closed:
-                      await ws.send_bytes(await q.get())
-
-              task = asyncio.create_task(pump())
-              try:
-                  async for _ in ws:
-                      pass
-              finally:
-                  task.cancel()
-                  AUDIO_CLIENTS.discard(q)
-              return ws
-
-          MIC_DEVICE = os.environ.get("MIC_DEVICE", "BlackHole 16ch")
-          MIC = {"ok": False, "rate": 48000, "buf": bytearray(), "lock": threading.Lock(),
-                 "primed": False, "err": "", "peak": 0}
-
-          def start_mic():
-              if os.environ.get("AUDIO", "true").lower() == "false":
-                  MIC["err"] = "audio disabled"
-                  return
-              try:
-                  import sounddevice as sd
-              except Exception as e:
-                  MIC["err"] = "sounddevice missing"
-                  log("mic unavailable:", repr(e))
-                  return
-              try:
-                  idx = None
-                  for i, d in enumerate(sd.query_devices()):
-                      if MIC_DEVICE.lower() in d["name"].lower() and d["max_output_channels"] > 0:
-                          idx = i
-                          break
-                  if idx is None:
-                      MIC["err"] = "BlackHole 16ch not found"
-                      log("mic device not found. Available:")
-                      log(sd.query_devices())
-                      return
-                  rate = int(sd.query_devices(idx)["default_samplerate"])
-                  MIC["rate"] = rate
-                  prime = rate * 4 * 4 // 100
-
-                  def cb(outdata, frames, tinfo, status):
-                      need = frames * 4
-                      chunk = b""
-                      with MIC["lock"]:
-                          have = len(MIC["buf"])
-                          if not MIC["primed"] and have >= prime:
-                              MIC["primed"] = True
-                          if MIC["primed"]:
-                              if have >= need:
-                                  chunk = bytes(MIC["buf"][:need])
-                                  del MIC["buf"][:need]
-                              else:
-                                  MIC["primed"] = False
-                      if len(chunk) < need:
-                          chunk += b"\0" * (need - len(chunk))
-                      outdata[:] = chunk
-
-                  stream = sd.RawOutputStream(device=idx, samplerate=rate, channels=2, dtype="int16", callback=cb)
-                  stream.start()
-                  MIC.update(ok=True, stream=stream)
-                  log("microphone path OK → %s @ %d Hz" % (MIC_DEVICE, rate))
-              except Exception as e:
-                  MIC["err"] = str(e)
-                  log("microphone open failed:", repr(e))
-
-          def audio_boot(loop):
-              start_audio(loop)
-              start_mic()
-
-          async def ws_mic(request):
-              if not authed(request):
-                  return web.Response(status=403, text="forbidden")
-              import audioop
-              ws = web.WebSocketResponse(heartbeat=20, compress=False, max_msg_size=1 << 18)
-              await ws.prepare(request)
-              await ws.send_json({"t": "fmt", "ok": MIC["ok"], "err": MIC["err"]})
-              in_rate, state = 16000, None
-              got = False
-
-              async def levels():
-                  while not ws.closed:
-                      await asyncio.sleep(0.5)
-                      pk, MIC["peak"] = MIC["peak"], 0
-                      if not ws.closed:
-                          await ws.send_json({"t": "lvl", "v": min(100, round(pk / 327.68))})
-
-              lv = asyncio.create_task(levels())
-              async for msg in ws:
-                  if msg.type == WSMsgType.TEXT:
-                      try:
-                          j = json.loads(msg.data)
-                          if j.get("t") == "fmt":
-                              in_rate = max(8000, min(96000, int(j.get("rate", 16000))))
-                              state = None
-                      except Exception:
-                          pass
-                  elif msg.type == WSMsgType.BINARY and MIC["ok"]:
-                      data = msg.data[: len(msg.data) // 2 * 2]
-                      if not data:
-                          continue
-                      if not got:
-                          got = True
-                          log("receiving browser mic audio @ %d Hz" % in_rate)
-                      if in_rate != MIC["rate"]:
-                          data, state = audioop.ratecv(data, 2, 1, in_rate, MIC["rate"], state)
-                      data = audioop.tostereo(data, 2, 1, 1)
-                      with MIC["lock"]:
-                          MIC["buf"] += data
-                          cap = MIC["rate"] * 2
-                          if len(MIC["buf"]) > cap:
-                              del MIC["buf"][: len(MIC["buf"]) - cap]
-              lv.cancel()
-              return ws
-
-          def find_app(root):
-              for dp, dns, _ in os.walk(root):
-                  for d in sorted(dns):
-                      if d.endswith(".app"):
-                          return os.path.join(dp, d)
-              return None
-
-          def install_any(path, launch):
-              work = tempfile.mkdtemp(prefix="app_")
-              try:
-                  low = path.lower()
-                  if low.endswith((".zip", ".ipa")):
-                      r = run(["ditto", "-x", "-k", path, work], timeout=300)
-                  elif low.endswith((".tgz", ".tar.gz")):
-                      r = run(["tar", "-xzf", path, "-C", work], timeout=300)
-                  else:
-                      return {"ok": False, "msg": "need .zip / .tar.gz / .ipa containing a Simulator .app"}
-                  if not r["ok"]:
-                      return {"ok": False, "msg": "unpack failed: " + r["msg"]}
-                  app = find_app(work)
-                  if not app:
-                      return {"ok": False, "msg": "no .app found inside archive"}
-                  r = run(["xcrun", "simctl", "install", UDID, app], timeout=300)
-                  if not r["ok"]:
-                      return {"ok": False, "msg": "install failed (must be Simulator build): " + r["msg"]}
-                  bid = ""
-                  try:
-                      p = subprocess.run(["plutil", "-extract", "CFBundleIdentifier", "raw", "-o", "-",
-                                          os.path.join(app, "Info.plist")], capture_output=True, text=True, timeout=20)
-                      bid = p.stdout.strip()
-                  except Exception:
-                      pass
-                  msg = "installed " + (bid or os.path.basename(app))
-                  if bid and BUNDLE_RE.match(bid):
-                      run(["xcrun", "simctl", "privacy", UDID, "grant", "microphone", bid])
-                      run(["xcrun", "simctl", "privacy", UDID, "grant", "location", bid])
-                  if launch and bid and BUNDLE_RE.match(bid):
-                      lr = run(["xcrun", "simctl", "launch", UDID, bid])
-                      if not lr["ok"]:
-                          msg += " (launch failed)"
-                  return {"ok": True, "msg": msg, "bundle": bid}
-              finally:
-                  shutil.rmtree(work, ignore_errors=True)
-
-          def install_url(b):
-              url = str(b.get("url", "")).strip()
-              if not url.lower().startswith("https://"):
-                  return {"ok": False, "msg": "link must start with https://"}
-              pth = urllib.parse.urlparse(url).path.lower()
-              ext = ".tar.gz" if pth.endswith((".tar.gz", ".tgz")) else ".ipa" if pth.endswith(".ipa") else ".zip"
-              d = tempfile.mkdtemp(prefix="dl_")
-              p = os.path.join(d, "dl" + ext)
-              try:
-                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                  total = 0
-                  with urllib.request.urlopen(req, timeout=90) as r, open(p, "wb") as f:
-                      while True:
-                          c = r.read(1 << 20)
-                          if not c:
-                              break
-                          total += len(c)
-                          if total > 1_500_000_000:
-                              return {"ok": False, "msg": "file > 1.5 GB"}
-                          f.write(c)
-                  return install_any(p, bool(b.get("launch")))
-              except Exception as e:
-                  return {"ok": False, "msg": "download failed: %s" % e}
-              finally:
-                  shutil.rmtree(d, ignore_errors=True)
-
-          def list_apps():
-              p1 = subprocess.run(["xcrun", "simctl", "listapps", UDID], capture_output=True, text=True, timeout=40)
-              p2 = subprocess.run(["plutil", "-convert", "json", "-o", "-", "-"], input=p1.stdout,
-                                  capture_output=True, text=True, timeout=20)
-              data = json.loads(p2.stdout)
-              out = []
-              for bid, info in data.items():
-                  out.append({"id": bid,
-                              "name": info.get("CFBundleDisplayName") or info.get("CFBundleName") or bid,
-                              "user": info.get("ApplicationType") == "User"})
-              out = [a for a in out if not a["id"].startswith("dev.bridge")]
-              out.sort(key=lambda a: (not a["user"], a["name"].lower()))
-              return out
-
-          async def apps_handler(request):
-              if not authed(request):
-                  return web.Response(status=403, text="forbidden")
-              try:
-                  return web.json_response({"apps": await asyncio.to_thread(list_apps)})
-              except Exception as e:
-                  return web.json_response({"apps": [], "error": str(e)}, status=500)
-
-          async def install_upload(request):
-              if not authed(request):
-                  return web.Response(status=403, text="forbidden")
-              name = os.path.basename(request.query.get("name", "app.zip")).lower()
-              ext = next((e for e in (".tar.gz", ".tgz", ".zip", ".ipa") if name.endswith(e)), None)
-              if not ext:
-                  return web.json_response({"ok": False, "msg": "use .zip / .tar.gz / .ipa"})
-              d = tempfile.mkdtemp(prefix="up_")
-              path = os.path.join(d, "upload" + ext)
-              try:
-                  with open(path, "wb") as f:
-                      async for chunk in request.content.iter_chunked(1 << 20):
-                          await asyncio.to_thread(f.write, chunk)
-                  res = await asyncio.to_thread(install_any, path, request.query.get("launch") == "1")
-                  return web.json_response(res)
-              finally:
-                  shutil.rmtree(d, ignore_errors=True)
-
-          PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
-          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-          <title>iOS Simulator</title>
-          <style>
-          :root{color-scheme:dark;--bg:#0d0f14;--card:#151922;--inner:#10131a;--line:#252b3b;--text:#e8eaf0;--muted:#8a94aa;--accent:#4c8dff;--danger:#ff6b6b;--ok:#3ddc84}
-          *{box-sizing:border-box}html,body{margin:0}
-          body{background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,system-ui,sans-serif;
-               padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
-          #app{max-width:980px;margin:0 auto;padding:12px 14px 24px;display:flex;flex-direction:column;gap:14px}
-          #top{display:flex;align-items:center;gap:10px}
-          #top .grow{flex:1}
-          .dot{width:9px;height:9px;border-radius:50%;background:#c9a227}
-          .dot.ok{background:var(--ok)}
-          #conn{font-weight:600}
-          #fps{font-size:12px;color:var(--muted)}
-          button{background:#1c2130;color:var(--text);border:1px solid var(--line);border-radius:12px;padding:10px 12px;min-height:42px;font:inherit;cursor:pointer}
-          button:hover{background:#232a3d}
-          button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-          button.danger{color:var(--danger);border-color:#5a2b33}
-          button.sm{min-height:34px;padding:6px 10px;font-size:13px}
-          button.chip{min-height:36px;border-radius:999px;padding:6px 14px;font-size:13px}
-          button.chip.on{background:#173a2a;border-color:#245c42;color:#8ff0b8}
-          input:not([type=checkbox]):not([type=range]),select{background:var(--inner);color:var(--text);border:1px solid var(--line);border-radius:12px;padding:11px 12px;font:inherit;width:100%;min-height:42px}
-          main{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:20px;align-items:start}
-          #stage{display:flex;flex-direction:column;align-items:center;gap:12px;position:sticky;top:12px}
-          #bezel{background:#000;border-radius:44px;padding:10px;box-shadow:0 0 0 2px #2a2d36,0 14px 40px #000a}
-          #scr{touch-action:none;cursor:pointer;line-height:0;border-radius:34px;overflow:hidden;background:#111;position:relative}
-          #cv{max-height:72vh;max-width:min(84vw,380px);width:auto;height:auto;display:block;user-select:none}
-          #dock{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
-          #dock button{min-width:58px;padding:8px 10px;font-size:13px}
-          #panel{background:var(--card);border:1px solid var(--line);border-radius:18px;overflow:hidden}
-          #tabs{display:flex;overflow-x:auto;border-bottom:1px solid var(--line)}
-          #tabs button{flex:1 0 auto;background:none;border:0;border-bottom:2px solid transparent;border-radius:0;padding:12px 14px;color:var(--muted);min-height:46px}
-          #tabs button.on{color:var(--text);border-bottom-color:var(--accent)}
-          .pane{display:none;padding:14px;gap:14px;flex-direction:column;max-height:calc(100vh - 140px);overflow-y:auto}
-          .pane.on{display:flex}
-          .card{background:var(--inner);border:1px solid var(--line);border-radius:14px;padding:12px;display:flex;flex-direction:column;gap:10px}
-          .card h3{margin:0;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600}
-          .grid{display:grid;gap:8px}.g2{grid-template-columns:1fr 1fr}.g3{grid-template-columns:repeat(3,1fr)}
-          .muted,small{color:var(--muted);font-size:12px}
-          .drop{display:flex;flex-direction:column;align-items:center;gap:4px;text-align:center;border:1.5px dashed #34405c;border-radius:12px;padding:18px 10px;cursor:pointer;color:var(--muted)}
-          .drop.over,.drop:hover{border-color:var(--accent);color:var(--text)}
-          .prog{height:5px;background:#1c2130;border-radius:3px;overflow:hidden;display:none}
-          .prog.on{display:block}
-          .prog i{display:block;height:100%;width:0;background:var(--accent)}
-          .app{display:flex;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--line);flex-wrap:wrap}
-          .app:first-child{border-top:0}
-          .app .info{flex:1;min-width:120px;display:flex;flex-direction:column}
-          .app .info small{word-break:break-all}
-          #toast{position:fixed;left:50%;bottom:calc(16px + env(safe-area-inset-bottom));transform:translate(-50%,20px);background:#222a3d;border:1px solid #34405c;border-radius:12px;padding:10px 14px;max-width:min(90vw,420px);opacity:0;pointer-events:none;transition:.2s;z-index:20;font-size:13px}
-          #toast.show{opacity:1;transform:translate(-50%,0)}
-          @media(max-width:820px){main{grid-template-columns:1fr}#stage{position:static}.pane{max-height:none}}
-          </style></head><body>
-          <div id="app">
-            <header id="top">
-              <span class="dot" id="dot"></span><span id="conn">Connecting</span><span id="fps"></span>
-              <span class="grow"></span>
-              <button class="chip" id="abtn" onclick="toggleAudio()">Sound</button>
-              <button class="chip" id="mbtn" onclick="toggleMic()">Mic off</button>
-            </header>
-            <main>
-              <section id="stage">
-                <div id="bezel"><div id="scr"><canvas id="cv" width="390" height="844"></canvas></div></div>
-                <div id="dock">
-                  <button onclick="btn('HOME')">Home</button>
-                  <button onclick="btn('LOCK')">Lock</button>
-                  <button onclick="post('/simbtn',{name:'volume_down'})">Vol −</button>
-                  <button onclick="post('/simbtn',{name:'volume_up'})">Vol +</button>
-                  <button onclick="post('/simbtn',{name:'action'})">Action</button>
-                  <button onclick="btn('SIRI')">Siri</button>
-                </div>
-              </section>
-              <aside id="panel">
-                <nav id="tabs">
-                  <button class="on" data-tab="controls">Controls</button>
-                  <button data-tab="apps">Apps</button>
-                  <button data-tab="device">Device</button>
-                  <button data-tab="session">Session</button>
-                </nav>
-
-                <div class="pane on" id="p-controls">
-                  <div class="card"><h3>Gestures</h3>
-                    <div class="grid g2">
-                      <button onclick="gest(0.5,0.995,0.5,0.6,0.25)">Go home</button>
-                      <button onclick="gest(0.5,0.995,0.5,0.55,1.0)">App switcher</button>
-                      <button onclick="gest(0.5,0.01,0.5,0.6,0.3)">Notifications</button>
-                      <button onclick="gest(0.95,0.01,0.95,0.5,0.3)">Control Center</button>
-                    </div>
-                  </div>
-                  <div class="card"><h3>Type</h3>
-                    <input id="txt" placeholder="Text to type">
-                    <div class="grid g3">
-                      <button class="primary" onclick="sendText()">Send</button>
-                      <button onclick="post('/key',{code:40})">Enter</button>
-                      <button onclick="post('/key',{code:42})">⌫</button>
-                    </div>
-                  </div>
-                  <div class="card"><h3>Clipboard</h3>
-                    <input id="clip" placeholder="Text for simulator clipboard">
-                    <div class="grid g2"><button onclick="post('/clip',{text:val('clip')})">Set</button><button onclick="post('/clipget',{})">Read</button></div>
-                  </div>
-                  <div class="card"><h3>Siri</h3>
-                    <input id="siritxt" placeholder="Ask Siri…">
-                    <button onclick="post('/siri',{text:val('siritxt')})">Ask Siri</button>
-                  </div>
-                </div>
-
-                <div class="pane" id="p-apps">
-                  <div class="card"><h3>Install app</h3>
-                    <label class="drop" id="drop">
-                      <b style="color:var(--text)">Drop .zip / .ipa / .tar.gz here</b>
-                      <small>Must contain a Simulator .app</small>
-                      <input id="file" type="file" accept=".zip,.ipa,.tgz,.gz" hidden>
-                    </label>
-                    <div class="prog" id="prog"><i id="progbar"></i></div>
-                    <div class="muted" id="upmsg"></div>
-                    <input id="appurl" placeholder="Or paste https:// link">
-                    <button onclick="installUrl()">Install from link</button>
-                    <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="launchafter" checked> Launch after install</label>
-                  </div>
-                  <div class="card"><h3>Installed apps</h3>
-                    <div id="apps"><div class="muted">Loading...</div></div>
-                    <button onclick="loadApps()">Refresh</button>
-                  </div>
-                  <div class="card"><h3>Open a link</h3>
-                    <input id="url" placeholder="https://... or myapp://...">
-                    <button onclick="post('/openurl',{url:val('url')})">Open</button>
-                  </div>
-                </div>
-
-                <div class="pane" id="p-device">
-                  <div class="card"><h3>Appearance</h3>
-                    <div class="grid g2"><button onclick="post('/appearance',{mode:'light'})">Light</button><button onclick="post('/appearance',{mode:'dark'})">Dark</button></div>
-                  </div>
-                  <div class="card"><h3>Status Bar</h3>
-                    <div class="grid g2">
-                      <button class="sm" onclick="post('/statusbar',{time:'9:41',battery:100,wifi:3,cellular:4,data:'LTE',operator:'Carrier'})">Full bars</button>
-                      <button class="sm" onclick="post('/statusbar',{time:'9:41',battery:20,wifi:1,cellular:1,data:'3G'})">Low signal</button>
-                      <button class="sm" onclick="post('/statusbar',{time:'9:41',battery:5,wifi:0,cellular:0,data:'None'})">No service</button>
-                      <button class="sm" onclick="post('/statusbar_clear',{})">Clear override</button>
-                    </div>
-                    <input id="sbtime" placeholder="Time (e.g. 9:41)">
-                    <div class="grid g2">
-                      <button class="sm" onclick="post('/statusbar',{time:val('sbtime')||'9:41'})">Set time</button>
-                      <button class="sm" onclick="post('/statusbar',{battery:parseInt(val('sbbat')||'80')})">Set battery %</button>
-                    </div>
-                    <input id="sbbat" type="number" min="0" max="100" placeholder="Battery %">
-                  </div>
-                  <div class="card"><h3>Location</h3>
-                    <div class="grid g2">
-                      <button class="sm" onclick="setLoc(37.7749,-122.4194)">San Francisco</button>
-                      <button class="sm" onclick="setLoc(40.7128,-74.0060)">New York</button>
-                      <button class="sm" onclick="setLoc(34.0522,-118.2437)">Los Angeles</button>
-                      <button class="sm" onclick="setLoc(51.5074,-0.1278)">London</button>
-                    </div>
-                    <div class="grid g2">
-                      <input id="lat" placeholder="Latitude" value="37.7749">
-                      <input id="lon" placeholder="Longitude" value="-122.4194">
-                    </div>
-                    <button onclick="setLoc(parseFloat(val('lat')),parseFloat(val('lon')))">Set custom location</button>
-                    <small class="muted">Real GPS is active by default (San Francisco).</small>
-                  </div>
-                  <div class="card"><h3>More</h3>
-                    <div class="grid g2">
-                      <button onclick="post('/shake',{})">Shake</button>
-                      <button onclick="post('/rotate',{dir:'left'})">Rotate left</button>
-                      <button onclick="post('/rotate',{dir:'right'})">Rotate right</button>
-                      <button onclick="btn('APPLE_PAY')">Apple Pay</button>
-                    </div>
-                  </div>
-                </div>
-
-                <div class="pane" id="p-session">
-                  <div class="card"><h3>Video stream</h3>
-                    <div class="grid g3">
-                      <button class="sm" onclick="preset(30,0.35,0.40)">Fast</button>
-                      <button class="sm" onclick="preset(45,0.45,0.50)">Balanced</button>
-                      <button class="sm" onclick="preset(60,0.55,0.60)">Sharp</button>
-                    </div>
-                    <label class="f">Frames per second <b id="st_fps_v">__FPS__</b></label>
-                    <input id="st_fps" type="range" min="15" max="60" value="__FPS__" oninput="sbv(this)">
-                    <label class="f">Size <b id="st_scale_v">__SCALE__</b></label>
-                    <input id="st_scale" type="range" min="0.25" max="1" step="0.05" value="__SCALE__" oninput="sbv(this)">
-                    <label class="f">Quality <b id="st_quality_v">__QUALITY__</b></label>
-                    <input id="st_quality" type="range" min="0.3" max="1" step="0.05" value="__QUALITY__" oninput="sbv(this)">
-                    <button class="primary" onclick="applyStream()">Apply</button>
-                  </div>
-                  <div class="card"><h3>Capture</h3>
-                    <button onclick="location.href='/shot.png'">Save screenshot</button>
-                  </div>
-                  <div class="card"><h3>Session</h3>
-                    <button class="danger" onclick="if(confirm('Stop the session?'))post('/stop',{})">Stop session</button>
-                  </div>
-                </div>
-              </aside>
-            </main>
-          </div>
-          <div id="toast"></div>
-          <script>
-          const cv=document.getElementById('cv'),scr=document.getElementById('scr');
-          const ctx=cv.getContext('2d',{alpha:false,desynchronized:true});
-          const tt=document.getElementById('toast'),fpsEl=document.getElementById('fps');
-          function val(i){return document.getElementById(i).value}
-          function toast(m){tt.textContent=m;tt.classList.add('show');clearTimeout(tt._t);tt._t=setTimeout(()=>tt.classList.remove('show'),3500)}
-          let ws=null,stopped=false,retry=0;
-          function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));else toast('not connected')}
-          function ack(){if(ws&&ws.readyState===1)ws.send('{"t":"ack"}')}
-          function post(p,b){send(Object.assign({t:p.slice(1)},b||{}))}
-          function btn(n){post('/button',{name:n})}
-          function gest(x1,y1,x2,y2,d){post('/swipe',{x1:x1,y1:y1,x2:x2,y2:y2,dur:d})}
-          function sendText(){post('/text',{text:val('txt')});document.getElementById('txt').value=''}
-          function setLoc(lat,lon){if(isNaN(lat)||isNaN(lon)){toast('bad coordinates');return}post('/location',{lat:lat,lon:lon});toast('Location set')}
-
-          let pending=null,busy=false,frames=0,received=0,lastT=performance.now();
-          async function drain(){
-            busy=true;
-            while(pending){
-              const b=pending;pending=null;
-              try{
-                const jpeg = b instanceof Blob ? b : new Blob([b],{type:'image/jpeg'});
-                const bm=await createImageBitmap(jpeg);
-                if(cv.width!==bm.width||cv.height!==bm.height){cv.width=bm.width;cv.height=bm.height}
-                ctx.drawImage(bm,0,0);bm.close();
-                frames++;
-              }catch(e){}
-              ack();
-            }
-            busy=false;
-          }
-          setInterval(()=>{
-            const n=performance.now(),dt=Math.max(1,n-lastT);
-            fpsEl.textContent=(frames*1000/dt).toFixed(1)+' fps · received '+(received*1000/dt).toFixed(1);
-            frames=0;received=0;lastT=n;
-          },1000);
-
-          function connect(){
-            if(stopped||(ws&&ws.readyState<=1))return;
-            ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
-            ws.onopen=()=>{retry=0;setConn(true);toast('Connected')};
-            ws.onmessage=e=>{
-              if(typeof e.data==='string'){
-                const j=JSON.parse(e.data);
-                if(j.t==='toast'){toast(j.msg);if(/^installed/i.test(j.msg)){document.getElementById('upmsg').textContent=j.msg;loadApps()}}
-                else if(j.t==='stopped'){stopped=true;audioOff();micOff();toast('session stopped')}
-                return;
-              }
-              received++;
-              if(pending)ack();
-              pending=e.data;
-              if(!busy)drain();
-            };
-            ws.onclose=()=>{
-              if(stopped)return;
-              setConn(false);toast('Reconnecting...');
-              setTimeout(connect,Math.min(3000,300*Math.pow(1.6,retry++)));
-            };
-          }
-          connect();
-          document.addEventListener('visibilitychange',()=>{if(!document.hidden)connect()});
-          window.addEventListener('online',connect);
-
-          let actx=null,aws=null,anext=0,arate=24000,ach=1,aon=false,gnode=null,volv=1;
-          const abtn=document.getElementById('abtn');
-          function setABtn(){abtn.textContent=aon?'Sound on':'Sound off';abtn.classList.toggle('on',aon)}
-          function setVol(v){volv=v/100;if(gnode)gnode.gain.value=volv}
-          function toggleAudio(){aon?audioOff():audioOn()}
-          function audioOn(){
-            actx=actx||new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});
-            if(!gnode){gnode=actx.createGain();gnode.gain.value=volv;gnode.connect(actx.destination)}
-            actx.resume();aon=true;setABtn();aconnect();
-          }
-          function audioOff(){aon=false;if(aws){try{aws.close()}catch(e){}}aws=null;setABtn()}
-          function aconnect(){
-            if(!aon||stopped)return;
-            aws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/wsa');
-            aws.binaryType='arraybuffer';
-            aws.onmessage=e=>{
-              if(typeof e.data==='string'){
-                const j=JSON.parse(e.data);
-                if(j.t==='fmt'){arate=j.rate;ach=j.ch;if(!j.ok){toast('audio not available on server');audioOff()}}
-                return;
-              }
-              play(e.data);
-            };
-            aws.onclose=()=>{if(aon&&!stopped)setTimeout(aconnect,1000)};
-          }
-          function play(buf){
-            if(!actx||buf.byteLength<2)return;
-            const i16=new Int16Array(buf,0,Math.floor(buf.byteLength/2)),n=Math.floor(i16.length/ach);
-            if(!n)return;
-            const ab=actx.createBuffer(ach,n,arate);
-            for(let c=0;c<ach;c++){const d=ab.getChannelData(c);for(let i=0;i<n;i++)d[i]=i16[i*ach+c]/32768}
-            const now=actx.currentTime;
-            if(anext<now+0.02)anext=now+0.08;
-            else if(anext>now+0.5)return;
-            const s=actx.createBufferSource();s.buffer=ab;s.connect(gnode);s.start(anext);anext+=ab.duration;
-          }
-
-          let mctx=null,mws=null,mstream=null,mon=false;
-          const mbtn=document.getElementById('mbtn');
-          function setMBtn(){mbtn.textContent=mon?'Mic on':'Mic off';mbtn.classList.toggle('on',mon)}
-          function toggleMic(){mon?micOff():micOn()}
-          function mconnect(){
-            if(!mon||stopped)return;
-            mws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/wsm');
-            mws.onopen=()=>{if(mctx)mws.send(JSON.stringify({t:'fmt',rate:mctx.sampleRate}))};
-            mws.onmessage=e=>{
-              if(typeof e.data!=='string')return;
-              const j=JSON.parse(e.data);
-              if(j.t==='fmt'&&!j.ok){toast('microphone not available on server'+(j.err?': '+j.err:''));micOff()}
-            };
-            mws.onclose=()=>{if(mon&&!stopped)setTimeout(mconnect,1000)};
-          }
-          function toPcm16(f){
-            const o=new Int16Array(f.length);
-            for(let i=0;i<f.length;i++){const v=Math.max(-1,Math.min(1,f[i]));o[i]=v<0?v*32768:v*32767}
-            return o.buffer;
-          }
-          async function micOn(){
-            if(mon)return;
-            try{
-              if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)throw new Error('needs a secure (https) page');
-              mstream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
-              const AC=window.AudioContext||window.webkitAudioContext;
-              mctx=new AC({latencyHint:'interactive'});
-              await mctx.resume();
-              const src=mctx.createMediaStreamSource(mstream),mute=mctx.createGain();
-              mute.gain.value=0;
-              const out=buf=>{if(mws&&mws.readyState===1)mws.send(buf)};
-              const node=mctx.createScriptProcessor(4096,1,1);
-              node.onaudioprocess=e=>out(toPcm16(e.inputBuffer.getChannelData(0)));
-              src.connect(node);node.connect(mute);mute.connect(mctx.destination);
-              mon=true;setMBtn();mconnect();toast('microphone on');
-            }catch(err){toast('mic: '+(err&&err.message||err));micOff()}
-          }
-          function micOff(){
-            mon=false;
-            if(mws){try{mws.close()}catch(e){}}mws=null;
-            if(mstream){mstream.getTracks().forEach(t=>t.stop())}mstream=null;
-            if(mctx){try{mctx.close()}catch(e){}}mctx=null;
-            setMBtn();
-          }
-
-          ['pointerup','touchend','click','keydown'].forEach(ev=>document.addEventListener(ev,()=>{if(actx&&actx.state==='suspended')actx.resume();if(mctx&&mctx.state==='suspended')mctx.resume()},{passive:true}));
-          audioOn();
-
-          // Multi-touch / 2-finger support
-          function frac(x,y){const r=cv.getBoundingClientRect();return[Math.min(1,Math.max(0,(x-r.left)/r.width)),Math.min(1,Math.max(0,(y-r.top)/r.height))]}
-          const pointers = new Map();
-          let mraf=0;
-
-          function sendTouch(t, id, p){
-            if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:t, id:id, x:p[0], y:p[1]}));
-          }
-
-          function flushMoves(){
-            mraf=0;
-            for(const [id, p] of pointers){
-              sendTouch('tm', id, p);
-            }
-          }
-
-          scr.addEventListener('pointerdown', e=>{
-            e.preventDefault();
-            const p = frac(e.clientX, e.clientY);
-            pointers.set(e.pointerId, p);
-            try{scr.setPointerCapture(e.pointerId)}catch(_){}
-            sendTouch('td', e.pointerId, p);
-          });
-
-          scr.addEventListener('pointermove', e=>{
-            if(!pointers.has(e.pointerId))return;
-            e.preventDefault();
-            pointers.set(e.pointerId, frac(e.clientX, e.clientY));
-            if(!mraf)mraf=requestAnimationFrame(flushMoves);
-          });
-
-          function endPointer(e){
-            if(!pointers.has(e.pointerId))return;
-            e.preventDefault();
-            if(mraf){cancelAnimationFrame(mraf);mraf=0}
-            const p = pointers.get(e.pointerId) || frac(e.clientX, e.clientY);
-            pointers.delete(e.pointerId);
-            sendTouch('tu', e.pointerId, p);
-          }
-          scr.addEventListener('pointerup', endPointer);
-          scr.addEventListener('pointercancel', endPointer);
-          scr.addEventListener('pointerleave', e=>{if(e.pointerType==='mouse')endPointer(e)});
-
-          function setConn(ok){document.getElementById('dot').classList.toggle('ok',ok);document.getElementById('conn').textContent=ok?'Connected':'Reconnecting...'}
-          document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',()=>{
-            document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('on',x===b));
-            document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.id==='p-'+b.dataset.tab));
-            if(b.dataset.tab==='apps')loadApps();
-          }));
-
-          function sbv(el){document.getElementById(el.id+'_v').textContent=el.value}
-          function setv(id,v){document.getElementById(id).value=v;if(document.getElementById(id+'_v'))document.getElementById(id+'_v').textContent=v}
-          function applyStream(){post('/stream',{fps:+val('st_fps'),scale:+val('st_scale'),quality:+val('st_quality')})}
-          function preset(f,s,q){setv('st_fps',f);setv('st_scale',s);setv('st_quality',q);applyStream()}
-
-          function el(tag,cls,txt){const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e}
-          function appRow(a,user){
-            const row=el('div','app'),info=el('div','info');
-            info.appendChild(el('b',null,a.name));info.appendChild(el('small',null,a.id));
-            row.appendChild(info);
-            const open=el('button','sm primary','Open');open.onclick=()=>post('/launch',{bundle:a.id});row.appendChild(open);
-            if(user){
-              const stop=el('button','sm','Stop');stop.onclick=()=>post('/kill',{bundle:a.id});row.appendChild(stop);
-              const del=el('button','sm danger','Delete');
-              del.onclick=()=>{if(confirm('Delete '+a.name+'?')){post('/uninstall',{bundle:a.id});setTimeout(loadApps,1500)}};
-              row.appendChild(del);
-            }
-            return row;
-          }
-          async function loadApps(){
-            const box=document.getElementById('apps');
-            try{
-              const r=await fetch('/apps',{credentials:'same-origin'}),j=await r.json();
-              box.textContent='';
-              const user=j.apps.filter(a=>a.user),sys=j.apps.filter(a=>!a.user);
-              if(!user.length)box.appendChild(el('div','muted','No installed apps yet.'));
-              user.forEach(a=>box.appendChild(appRow(a,true)));
-              if(sys.length){
-                const d=el('details');d.appendChild(el('summary',null,'System apps ('+sys.length+')'));
-                sys.forEach(a=>d.appendChild(appRow(a,false)));box.appendChild(d);
-              }
-            }catch(e){box.textContent='Could not load apps'}
-          }
-          function upload(file){
-            if(!file)return;
-            const pb=document.getElementById('prog'),bar=document.getElementById('progbar'),msg=document.getElementById('upmsg');
-            pb.classList.add('on');bar.style.width='0%';msg.textContent='Uploading...';
-            const x=new XMLHttpRequest();
-            x.open('POST','/install?name='+encodeURIComponent(file.name)+'&launch='+(document.getElementById('launchafter').checked?1:0));
-            x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);bar.style.width=p+'%';msg.textContent='Uploading '+p+'%'}};
-            x.upload.onload=()=>{msg.textContent='Installing...'};
-            x.onload=()=>{
-              pb.classList.remove('on');
-              let j={};try{j=JSON.parse(x.responseText)}catch(e){j={msg:'HTTP '+x.status}}
-              msg.textContent=j.msg||'';toast(j.msg||'done');loadApps();
-            };
-            x.onerror=()=>{pb.classList.remove('on');msg.textContent='Upload failed';toast('upload failed')};
-            x.send(file);
-          }
-          document.getElementById('file').addEventListener('change',e=>{upload(e.target.files[0]);e.target.value=''});
-          (function(){
-            const dz=document.getElementById('drop');
-            ['dragover','dragenter'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('over')}));
-            ['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('over')}));
-            dz.addEventListener('drop',e=>{const f=e.dataTransfer&&e.dataTransfer.files[0];if(f)upload(f)});
-          })();
-          function installUrl(){
-            const u=val('appurl').trim();
-            if(!u){toast('Paste a link first');return}
-            document.getElementById('upmsg').textContent='Downloading and installing...';
-            post('/installurl',{url:u,launch:document.getElementById('launchafter').checked});
-          }
-          loadApps();
-          </script></body></html>'''
-
-          async def main():
-              app = web.Application()
-              app.add_routes([web.get("/", index), web.get("/ws", ws_handler), web.get("/wsa", ws_audio), web.get("/wsm", ws_mic), web.get("/apps", apps_handler), web.post("/install", install_upload), web.get("/shot.png", shot)])
-              runner = web.AppRunner(app, access_log=None)
-              await runner.setup()
-              await web.TCPSite(runner, "127.0.0.1", PORT).start()
-              asyncio.create_task(capture())
-              asyncio.create_task(init_native())
-              asyncio.create_task(hid_pump())
-              _loop = asyncio.get_running_loop()
-              _loop.run_in_executor(POOL, audio_boot, _loop)
-              await STOP_EV.wait()
-              await asyncio.sleep(0.5)
-              await runner.cleanup()
-
-          if __name__ == "__main__":
-              asyncio.run(main())
-          PYEOF
-          python3 -m py_compile server.py && echo "server.py OK"
-
-      - name: Start session and print the link
-        run: |
-          export TOKEN=$(openssl rand -hex 12)
-          export PORT=8080
-          export FPS="${FPS:-60}"
-          export SCALE="${SCALE:-0.45}"
-          export QUALITY="${QUALITY:-0.50}"
-          export WINDOW=4
-          export GRPC_PORT=10882
-
-          command -v cloudflared >/dev/null || { echo "cloudflared missing"; exit 1; }
-
-          if [ "$AUDIO" = "true" ] && command -v SwitchAudioSource >/dev/null; then
-            SwitchAudioSource -s "BlackHole 2ch" -t output || true
-            SwitchAudioSource -s "BlackHole 16ch" -t input || true
-          fi
-
-          if command -v idb_companion >/dev/null && command -v idb >/dev/null; then
-            nohup idb_companion --udid "$UDID" --grpc-port "$GRPC_PORT" > companion.log 2>&1 &
-            for i in $(seq 1 40); do nc -z localhost "$GRPC_PORT" 2>/dev/null && break; sleep 1; done
-            if nc -z localhost "$GRPC_PORT" 2>/dev/null; then
-              echo "idb companion is listening"
-              idb connect localhost "$GRPC_PORT" || true
-            else
-              echo "idb companion did not start:"
-              cat companion.log
-            fi
-          else
-            echo "idb / idb_companion missing"
-          fi
-
-          rm -f "$HOME"/xcbtn.cmd "$HOME"/xcbtn.ready "$HOME"/xcbtn.result "$HOME"/xcbtn.running
-          XR=$(ls bridge/build/Build/Products/*.xctestrun 2>/dev/null | head -1 || true)
-          if [ -n "$XR" ]; then
-            touch "$HOME/xcbtn.running"
-            XR="$XR" UDID="$UDID" nohup bash -c 'while true; do xcodebuild test-without-building -xctestrun "$XR" -destination "id=$UDID" >> bridge.log 2>&1; rm -f "$HOME/xcbtn.ready"; sleep 2; done' > /dev/null 2>&1 &
-            (
-              for i in $(seq 1 90); do [ -f "$HOME/xcbtn.ready" ] && break; sleep 2; done
-              if [ -f "$HOME/xcbtn.ready" ]; then echo "button bridge ready"; else echo "button bridge NOT ready:"; tail -30 bridge.log; fi
-            ) &
-          fi
-
-          if command -v simpod >/dev/null; then
-            simpod --detach -q || true
-            sleep 2
-          fi
-
-          nohup python3 server.py > server.log 2>&1 &
-          SERVER_PID=$!
-          for i in $(seq 1 90); do
-            curl -fsS "http://127.0.0.1:$PORT/?key=$TOKEN" -o /dev/null 2>/dev/null && break
-            kill -0 "$SERVER_PID" 2>/dev/null || { echo "server exited:"; cat server.log; exit 1; }
-            sleep 1
-          done
-          curl -fsS "http://127.0.0.1:$PORT/?key=$TOKEN" -o /dev/null || { echo "server not answering:"; cat server.log; exit 1; }
-          tail -n +1 -f server.log &
-
-          nohup cloudflared tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 > cf.log 2>&1 &
-          CF_PID=$!
-          URL=""
-          for i in $(seq 1 60); do
-            URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cf.log | head -1 || true)
-            [ -n "$URL" ] && break
-            sleep 2
-          done
-          if [ -z "$URL" ]; then cat cf.log; exit 1; fi
-
-          FULL="$URL/?key=$TOKEN"
-          echo "::notice title=Simulator link::$FULL"
-          {
-            echo "## iOS $VER simulator is live"
-            echo
-            echo "$FULL"
-            echo
-            echo "Anyone with this link can control the simulator. It ends in $MINUTES minutes or when you press Stop session."
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "OPEN THIS: $FULL"
-
-          END=$((SECONDS + MINUTES * 60))
-          while kill -0 "$SERVER_PID" 2>/dev/null && [ "$SECONDS" -lt "$END" ]; do sleep 5; done
-
-          kill "$SERVER_PID" "$CF_PID" 2>/dev/null || true
-          xcrun simctl shutdown "$UDID" || true
-          echo "Session ended."
