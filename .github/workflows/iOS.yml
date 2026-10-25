@@ -30,7 +30,6 @@ jobs:
       DEVICE: ${{ inputs.device }}
       AUDIO: ${{ inputs.audio }}
       TZNAME: ${{ inputs.timezone }}
-      # Hard-coded for speed + stability
       MINUTES: '300'
       FPS: '24'
       SCALE: '0.35'
@@ -268,75 +267,319 @@ jobs:
 
       - name: Write the web server
         run: |
-          cat > server.py <<'PYEOF'
-          # ============================================================
-          # You still need to paste the FULL server.py from your uploaded
-          # file into this block, then replace the stream_idb + capture
-          # functions with the pure-idb versions shown in previous messages.
-          # ============================================================
-          print("Paste full server.py here")
-          PYEOF
-          echo "WARNING: Paste the complete server.py content from your previous file!"
+          cat > server.py << 'PYEOF'
+          import asyncio, hmac, json, logging, os, re, shutil, subprocess, sys, tempfile, threading, time
+          import urllib.parse, urllib.request
+          from concurrent.futures import ThreadPoolExecutor
+          from contextlib import AsyncExitStack
+          from aiohttp import web, WSMsgType
 
-      - name: Start session
-        run: |
-          export TOKEN=$(openssl rand -hex 12)
-          export PORT=8080
-          export FPS="${FPS:-24}"
-          export SCALE="${SCALE:-0.35}"
-          export QUALITY="${QUALITY:-0.40}"
-          export GRPC_PORT=10882
+          UDID = os.environ["UDID"]
+          TOKEN = os.environ["TOKEN"]
+          PORT = int(os.environ.get("PORT", "8080"))
+          GRPC_PORT = int(os.environ.get("GRPC_PORT", "10882"))
+          IDB = os.environ.get("IDB", "idb")
+          FPS = os.environ.get("FPS", "24")
+          SCALE = os.environ.get("SCALE", "0.35")
+          QUALITY = os.environ.get("QUALITY", "0.40")
+          WINDOW = 3
+          STREAM = {"fps": FPS, "scale": SCALE, "quality": QUALITY, "gen": 0}
 
-          command -v cloudflared >/dev/null || { echo "cloudflared missing"; exit 1; }
+          FRAME = {"data": b"", "id": 0}
+          MODE = {"v": "starting"}
+          POINTS = {"v": None}
+          NATIVE = {"c": None, "btn": None}
+          COND = asyncio.Condition()
+          STOP_EV = asyncio.Event()
+          INPUT_LOCK = asyncio.Lock()
+          POOL = ThreadPoolExecutor(max_workers=4)
+          LOCK = threading.Lock()
+          BG = set()
 
-          if [ "$AUDIO" = "true" ] && command -v SwitchAudioSource >/dev/null; then
-            SwitchAudioSource -s "BlackHole 2ch" -t output || true
-            SwitchAudioSource -s "BlackHole 16ch" -t input  || true
-          fi
+          AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "BlackHole 2ch")
+          AUDIO_RATE = int(os.environ.get("AUDIO_RATE", "24000"))
+          AUDIO = {"ok": False, "ch": 1}
+          AUDIO_CLIENTS = set()
 
-          if command -v idb_companion >/dev/null; then
-            nohup idb_companion --udid "$UDID" --grpc-port "$GRPC_PORT" > companion.log 2>&1 &
-            for i in $(seq 1 30); do nc -z localhost "$GRPC_PORT" 2>/dev/null && break; sleep 1; done
-            idb connect localhost "$GRPC_PORT" || true
-          fi
+          def log(*a):
+              print(*a, flush=True)
 
-          rm -f "$HOME"/xcbtn.*
-          XR=$(ls bridge/build/Build/Products/*.xctestrun 2>/dev/null | head -1 || true)
-          if [ -n "$XR" ]; then
-            touch "$HOME/xcbtn.running"
-            XR="$XR" UDID="$UDID" nohup bash -c 'while true; do xcodebuild test-without-building -xctestrun "$XR" -destination "id=$UDID" >> bridge.log 2>&1; rm -f "$HOME/xcbtn.ready"; sleep 2; done' &
-          fi
+          def run(cmd, timeout=40, inp=None):
+              try:
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=inp)
+                  out = (r.stdout + r.stderr).strip()
+                  return {"ok": r.returncode == 0, "msg": (out[:300] if out else "ok")}
+              except FileNotFoundError:
+                  return {"ok": False, "msg": "command not found: " + cmd[0]}
+              except Exception as e:
+                  return {"ok": False, "msg": str(e)}
 
-          nohup python3 server.py > server.log 2>&1 &
-          SERVER_PID=$!
+          def idb(args):
+              return run([IDB] + args + ["--udid", UDID])
 
-          for i in $(seq 1 45); do
-            curl -fsS "http://127.0.0.1:$PORT/?key=$TOKEN" -o /dev/null && break
-            kill -0 "$SERVER_PID" 2>/dev/null || { cat server.log; exit 1; }
-            sleep 1
-          done
+          def points():
+              if POINTS["v"]:
+                  return POINTS["v"]
+              out = subprocess.run([IDB, "describe", "--udid", UDID, "--json"],
+                                   capture_output=True, text=True, timeout=25).stdout
+              sd = json.loads(out)["screen_dimensions"]
+              POINTS["v"] = (float(sd["width_points"]), float(sd["height_points"]))
+              return POINTS["v"]
 
-          nohup cloudflared tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 > cf.log 2>&1 &
-          CF_PID=$!
+          SIMPOD = os.environ.get("SIMPOD", "simpod")
+          BUNDLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+          SIM_BUTTONS = ("volume_up", "volume_down", "action")
+          BAD = {"ok": False, "msg": "bad request"}
 
-          URL=""
-          for i in $(seq 1 40); do
-            URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cf.log | head -1 || true)
-            [ -n "$URL" ] && break
-            sleep 2
-          done
-          [ -n "$URL" ] || { cat cf.log; exit 1; }
+          def volume(name):
+              short = name.replace("_", "-")
+              for a in (["button", name], ["button", short], [short], [name]):
+                  r = simpod(a)
+                  if r["ok"]:
+                      return {"ok": True, "msg": "volume via simpod"}
+              r = bridge(name, wait=10.0)
+              if r is not None:
+                  return {"ok": r["ok"], "msg": ("volume via Control Center" if r["ok"] else r["msg"])}
+              return idb(["ui", "key", "128" if name == "volume_up" else "129"])
 
-          FULL="$URL/?key=$TOKEN"
-          echo "========================================"
-          echo "OPEN THIS: $FULL"
-          echo "========================================"
-          echo "::notice title=Simulator link::$FULL"
-          echo "## Live simulator" >> "$GITHUB_STEP_SUMMARY"
-          echo "$FULL" >> "$GITHUB_STEP_SUMMARY"
+          def simpod(args):
+              r = run([SIMPOD] + args + ["-d", UDID])
+              if not r["ok"]:
+                  r2 = run([SIMPOD] + args)
+                  if r2["ok"]:
+                      return r2
+              return r
 
-          END=$((SECONDS + MINUTES * 60))
-          while kill -0 "$SERVER_PID" 2>/dev/null && [ "$SECONDS" -lt "$END" ]; do sleep 8; done
+          def simctl(*args, inp=None):
+              return run(["xcrun", "simctl"] + list(args), inp=inp)
 
-          kill "$SERVER_PID" "$CF_PID" 2>/dev/null || true
-          xcrun simctl shutdown "$UDID" || true
+          HOME = os.path.expanduser("~")
+          BR_CMD, BR_READY, BR_OUT, BR_RUNNING = (os.path.join(HOME, n) for n in ("xcbtn.cmd", "xcbtn.ready", "xcbtn.result", "xcbtn.running"))
+
+          def bridge(cmd, wait=5.0):
+              for _ in range(80):
+                  if os.path.exists(BR_READY) or not os.path.exists(BR_RUNNING):
+                      break
+                  time.sleep(0.25)
+              if not os.path.exists(BR_READY):
+                  return None
+              try:
+                  if os.path.exists(BR_OUT):
+                      os.unlink(BR_OUT)
+                  with open(BR_CMD + ".tmp", "w") as f:
+                      f.write(cmd)
+                  os.replace(BR_CMD + ".tmp", BR_CMD)
+              except Exception as e:
+                  return {"ok": False, "msg": "bridge write failed: %s" % e}
+              t0 = time.time()
+              while time.time() - t0 < wait:
+                  if not os.path.exists(BR_CMD) and os.path.exists(BR_OUT):
+                      try:
+                          msg = open(BR_OUT).read().strip() or "ok"
+                      except Exception:
+                          msg = "ok"
+                      return {"ok": msg == "ok", "msg": msg}
+                  time.sleep(0.05)
+              return {"ok": False, "msg": "bridge timed out"}
+
+          def extra(b):
+              t = b.get("t")
+              if t == "simbtn":
+                  name = b.get("name")
+                  if name not in SIM_BUTTONS:
+                      return BAD
+                  if name != "action":
+                      return volume(name)
+                  r = bridge(name)
+                  if r is not None:
+                      return r
+                  return {"ok": False, "msg": "Action button needs XCUITest bridge"}
+              if t == "siri":
+                  text = str(b.get("text", "")).strip()[:200]
+                  if not text:
+                      return {"ok": False, "msg": "type what to ask Siri"}
+                  r = bridge("siri:" + text, wait=12.0)
+                  return r if r is not None else {"ok": False, "msg": "Ask Siri needs XCUITest bridge"}
+              if t == "rotate":
+                  r = simpod(["rotate-left" if b.get("dir") == "left" else "rotate-right"])
+                  POINTS["v"] = None
+                  return r
+              if t == "shake":
+                  return notify("com.apple.UIKit.SimulatorShake")
+              if t == "clip":
+                  return simctl("pbcopy", UDID, inp=str(b.get("text", "")))
+              if t == "clipget":
+                  return simctl("pbpaste", UDID)
+              if t == "uninstall":
+                  bundle = str(b.get("bundle", ""))
+                  return simctl("uninstall", UDID, bundle) if BUNDLE_RE.match(bundle) else BAD
+              if t == "kill":
+                  bundle = str(b.get("bundle", ""))
+                  return simctl("terminate", UDID, bundle) if BUNDLE_RE.match(bundle) else BAD
+              if t == "location":
+                  lat = b.get("lat")
+                  lon = b.get("lon")
+                  if lat is None or lon is None:
+                      return {"ok": False, "msg": "need lat and lon"}
+                  return simctl("location", UDID, "set", f"{lat},{lon}")
+              if t == "statusbar":
+                  args = ["status_bar", UDID, "override"]
+                  if "time" in b: args += ["--time", str(b["time"])]
+                  if "battery" in b: args += ["--batteryLevel", str(int(b["battery"]))]
+                  if "wifi" in b: args += ["--wifiBars", str(int(b["wifi"]))]
+                  if "cellular" in b: args += ["--cellularBars", str(int(b["cellular"]))]
+                  if "data" in b: args += ["--dataNetwork", str(b["data"])]
+                  if "operator" in b: args += ["--operatorName", str(b["operator"])]
+                  return simctl(*args)
+              if t == "statusbar_clear":
+                  return simctl("status_bar", UDID, "clear")
+              return None
+
+          def notify(name):
+              return simctl("spawn", UDID, "notifyutil", "-p", name)
+
+          BUTTONS = ("HOME", "LOCK", "SIDE_BUTTON", "SIRI", "APPLE_PAY")
+
+          def handle(b):
+              t = b.get("t")
+              if str(b.get("bundle", "")).startswith("dev.bridge"):
+                  return {"ok": False, "msg": "leave the button bridge running"}
+              with LOCK:
+                  if t == "tap":
+                      W, H = points()
+                      a = ["ui", "tap", str(round(b["x"] * W)), str(round(b["y"] * H))]
+                      if b.get("dur", 0) > 0:
+                          a += ["--duration", str(b["dur"])]
+                      return idb(a)
+                  if t == "swipe":
+                      W, H = points()
+                      a = ["ui", "swipe", str(round(b["x1"] * W)), str(round(b["y1"] * H)),
+                           str(round(b["x2"] * W)), str(round(b["y2"] * H)),
+                           "--duration", str(b.get("dur", 0.3))]
+                      return idb(a)
+                  if t == "button":
+                      name = b.get("name", "")
+                      if name not in BUTTONS:
+                          return {"ok": False, "msg": "bad button"}
+                      if name == "SIRI":
+                          r = idb(["ui", "button", name, "--duration", "1"])
+                          if r["ok"]:
+                              return r
+                      return idb(["ui", "button", name])
+                  if t == "text":
+                      return idb(["ui", "text", str(b.get("text", ""))])
+                  if t == "key":
+                      return idb(["ui", "key", str(int(b["code"]))])
+                  if t == "appearance":
+                      mode = b.get("mode")
+                      if mode not in ("light", "dark"):
+                          return {"ok": False, "msg": "bad mode"}
+                      return run(["xcrun", "simctl", "ui", UDID, "appearance", mode])
+                  if t == "openurl":
+                      return run(["xcrun", "simctl", "openurl", UDID, str(b.get("url", ""))])
+                  if t == "launch":
+                      return run(["xcrun", "simctl", "launch", UDID, str(b.get("bundle", ""))])
+                  r = extra(b)
+                  if r is not None:
+                      return r
+              return {"ok": False, "msg": "unknown action"}
+
+          HQ = asyncio.Queue()
+
+          async def hid_pump():
+              try:
+                  from idb.common.types import HIDPress, HIDTouch, HIDDirection, Point
+              except Exception as e:
+                  log("live touch unavailable:", repr(e))
+                  return
+              NATIVE["ev"] = (HIDPress, HIDTouch, HIDDirection, Point)
+
+              async def gen():
+                  while True:
+                      yield await HQ.get()
+
+              while not STOP_EV.is_set():
+                  if not NATIVE["c"]:
+                      await asyncio.sleep(0.5)
+                      continue
+                  while not HQ.empty():
+                      HQ.get_nowait()
+                  NATIVE["hid"] = True
+                  log("live touch stream open")
+                  try:
+                      await NATIVE["c"].hid(gen())
+                  except Exception as e:
+                      log("live touch stream restarting:", repr(e))
+                  NATIVE["hid"] = False
+                  await asyncio.sleep(0.5)
+
+          def touch(b, st):
+              t = b.get("t")
+              try:
+                  fx = min(1.0, max(0.0, float(b["x"])))
+                  fy = min(1.0, max(0.0, float(b["y"])))
+              except Exception:
+                  return
+              pid = b.get("id", 0)
+              if t == "td":
+                  st.setdefault("starts", {})[pid] = (fx, fy, time.time())
+              ev = NATIVE.get("ev")
+              if ev and NATIVE.get("hid") and POINTS["v"]:
+                  W, H = POINTS["v"]
+                  if t == "tm" and HQ.qsize() > 12:
+                      return
+                  press, tch, direction, point = ev
+                  HQ.put_nowait(press(tch(point(fx * W, fy * H)), direction.UP if t == "tu" else direction.DOWN))
+                  return
+              if not POINTS["v"]:
+                  th = asyncio.create_task(asyncio.to_thread(points))
+                  BG.add(th)
+                  th.add_done_callback(BG.discard)
+              if t != "tu":
+                  return
+              starts = st.get("starts", {})
+              if pid not in starts:
+                  return
+              sx, sy, t0 = starts.pop(pid)
+              if abs(fx - sx) + abs(fy - sy) < 0.02:
+                  req = {"t": "tap", "x": fx, "y": fy, "dur": 0}
+              else:
+                  req = {"t": "swipe", "x1": sx, "y1": sy, "x2": fx, "y2": fy,
+                         "dur": max(0.08, min(time.time() - t0, 0.5))}
+              th = asyncio.create_task(handle_async(req))
+              BG.add(th)
+              th.add_done_callback(BG.discard)
+
+          async def init_native():
+              try:
+                  from idb.common.types import TCPAddress, HIDButtonType
+                  from idb.grpc.client import Client
+                  stack = AsyncExitStack()
+                  client = await stack.enter_async_context(Client.build(
+                      address=TCPAddress(host="localhost", port=GRPC_PORT),
+                      logger=logging.getLogger("idb")))
+                  NATIVE["c"] = client
+                  NATIVE["btn"] = HIDButtonType
+                  NATIVE["stack"] = stack
+                  log("native idb client connected")
+              except Exception as e:
+                  log("native idb client unavailable:", repr(e))
+
+          async def handle_async(b):
+              t = b.get("t")
+              if t == "installurl":
+                  return await asyncio.get_running_loop().run_in_executor(POOL, install_url, b)
+              async with INPUT_LOCK:
+                  c = NATIVE["c"]
+                  if c and t in ("tap", "swipe", "button", "text", "key"):
+                      try:
+                          if t in ("tap", "swipe"):
+                              W, H = POINTS["v"] or await asyncio.to_thread(points)
+                          if t == "tap":
+                              d = float(b.get("dur", 0) or 0)
+                              await c.tap(round(b["x"] * W), round(b["y"] * H), d if d > 0 else None)
+                          elif t == "swipe":
+                              await c.swipe((round(b["x1"] * W), round(b["y1"] * H)),
+                                            (round(b["x2"] * W), round(b["y2"] * H)),
+                                            duration=float(b.get("dur", 0.3)))
+                          elif t == "button":
