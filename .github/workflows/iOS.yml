@@ -258,6 +258,8 @@ jobs:
                           var result = "ok"
                           if c == "action" {
                               device.press(.action)
+                          } else if c == "home" {
+                              device.press(.home)
                           } else if c == "volume_up" {
                               result = self.setVolume(0.0625)
                           } else if c == "volume_down" {
@@ -308,7 +310,7 @@ jobs:
           COND = asyncio.Condition()
           STOP_EV = asyncio.Event()
           INPUT_LOCK = asyncio.Lock()
-          POOL = ThreadPoolExecutor(max_workers=4)
+          POOL = ThreadPoolExecutor(max_workers=8)
           LOCK = threading.Lock()
           BG = set()
 
@@ -373,9 +375,9 @@ jobs:
 
 
           def simpod(args):
-              r = run([SIMPOD] + args + ["-d", UDID])
+              r = run([SIMPOD] + args + ["-d", UDID], timeout=8)
               if not r["ok"]:
-                  r2 = run([SIMPOD] + args)
+                  r2 = run([SIMPOD] + args, timeout=8)
                   if r2["ok"]:
                       return r2
               return r
@@ -657,9 +659,9 @@ jobs:
                       return run(["xcrun", "simctl", "openurl", UDID, str(b.get("url", ""))])
                   if t == "launch":
                       return run(["xcrun", "simctl", "launch", UDID, str(b.get("bundle", ""))])
-                  r = extra(b)
-                  if r is not None:
-                      return r
+              r = extra(b)
+              if r is not None:
+                  return r
               return {"ok": False, "msg": "unknown action"}
 
 
@@ -750,6 +752,13 @@ jobs:
 
           async def handle_async(b):
               t = b.get("t")
+              if t == "button" and b.get("name") == "HOME":
+                  hr = await asyncio.get_running_loop().run_in_executor(POOL, bridge, "home", 4.0)
+                  log("[home] bridge ->", hr)
+                  if hr is not None and hr["ok"]:
+                      return hr
+                  b = {"t": "swipe", "x1": 0.5, "y1": 0.999, "x2": 0.5, "y2": 0.5, "dur": 0.15}
+                  t = "swipe"
               if t == "installurl":
                   return await asyncio.get_running_loop().run_in_executor(POOL, install_url, b)
               if t == "button" and b.get("name") == "SIRI":
@@ -1387,6 +1396,9 @@ jobs:
           .sysapps summary{padding:8px 0}
           #toast{position:fixed;left:50%;bottom:calc(18px + env(safe-area-inset-bottom));transform:translate(-50%,20px);background:#222a3d;border:1px solid #34405c;border-radius:12px;padding:10px 16px;max-width:min(92vw,480px);opacity:0;pointer-events:none;transition:.2s;z-index:20;font-size:13px;word-break:break-word}
           #toast.show{opacity:1;transform:translate(-50%,0)}
+          #clog{font:12px/1.5 ui-monospace,Menlo,monospace;background:#0a0c10;border:1px solid var(--line);border-radius:12px;padding:10px;height:340px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;color:#b8c2d8}
+          #cbadge{background:var(--accent);color:#fff;border-radius:9px;padding:0 6px;font-size:11px;margin-left:6px}
+          #cbadge:empty{display:none}
           @media(max-width:880px){
             main{grid-template-columns:1fr}
             #stage{position:static}
@@ -1419,6 +1431,7 @@ jobs:
                   <button data-tab="device">Device</button>
                   <button data-tab="status">Status bar</button>
                   <button data-tab="session">Session</button>
+                  <button data-tab="console">Console<span id="cbadge"></span></button>
                 </nav>
 
                 <div class="pane on" id="p-controls">
@@ -1570,6 +1583,12 @@ jobs:
                     <button class="danger" onclick="if(confirm('Stop the session?'))post('/stop',{})">Stop session</button>
                   </div>
                 </div>
+                <div class="pane" id="p-console">
+                  <div class="card"><h3>Console</h3>
+                    <div id="clog"></div>
+                    <div class="grid g2"><button onclick="document.getElementById('clog').textContent=''">Clear</button><button onclick="navigator.clipboard&amp;&amp;navigator.clipboard.writeText(document.getElementById('clog').innerText)">Copy</button></div>
+                  </div>
+                </div>
               </aside>
             </main>
           </div>
@@ -1579,7 +1598,17 @@ jobs:
           const ctx=cv.getContext('2d',{alpha:false,desynchronized:true});
           const tt=document.getElementById('toast'),fpsEl=document.getElementById('fps');
           function val(i){return document.getElementById(i).value}
-          let toastT;function toast(m){tt.textContent=m;tt.classList.add('show');clearTimeout(toastT);toastT=setTimeout(()=>tt.classList.remove('show'),3500)}
+          let unread=0;
+          function toast(m){
+            const box=document.getElementById('clog');if(!box)return;
+            const d=new Date(),p=n=>String(n).padStart(2,'0');
+            const line=document.createElement('div');
+            line.textContent=p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())+'  '+m;
+            box.appendChild(line);
+            while(box.childNodes.length>300)box.removeChild(box.firstChild);
+            box.scrollTop=box.scrollHeight;
+            if(!document.getElementById('p-console').classList.contains('on')){unread++;document.getElementById('cbadge').textContent=unread}
+          }
           let ws=null,stopped=false,retry=0;
           function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));else toast('not connected')}
           function ack(){if(ws&&ws.readyState===1)ws.send('{"t":"ack"}')}
@@ -1680,7 +1709,7 @@ jobs:
             post('/statusbar',{mode:'set',time:isoNow()});
           }
           function toggleClock(){clockOn=!clockOn;lastTz='';$('clocksync').textContent='Clock and time zone from this device: '+(clockOn?'on':'off');if(clockOn)clockSync()}
-          setInterval(clockSync,10000);
+          (function tick(){setTimeout(()=>{clockSync();tick()},60000-(Date.now()%60000)+150)})();
           function sbVals(){return{mode:'set',time:clockOn?isoNow():val('sb_time'),op:val('sb_op'),cm:val('sb_cm'),cb:+val('sb_cb'),net:val('sb_net'),wm:val('sb_wm'),wb:+val('sb_wb'),bl:+val('sb_bl'),bs:val('sb_bs')}}
           function sbApply(){post('/statusbar',sbVals())}
           function applyStream(){post('/stream',{fps:+val('st_fps'),scale:+val('st_scale'),quality:+val('st_quality')})}
@@ -1823,6 +1852,7 @@ jobs:
             document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('on',x===b));
             document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.id==='p-'+b.dataset.tab));
             if(b.dataset.tab==='apps')loadApps();
+            if(b.dataset.tab==='console'){unread=0;document.getElementById('cbadge').textContent='';const c=document.getElementById('clog');c.scrollTop=c.scrollHeight}
           }));
 
           function el(tag,cls,txt){const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e}
