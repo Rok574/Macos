@@ -306,7 +306,7 @@ jobs:
           FRAME = {"data": b"", "id": 0}
           MODE = {"v": "starting"}
           POINTS = {"v": None}
-          NATIVE = {"c": None, "btn": None}
+          NATIVE = {"c": None, "btn": None, "fails": 0}
           COND = asyncio.Condition()
           STOP_EV = asyncio.Event()
           INPUT_LOCK = asyncio.Lock()
@@ -355,6 +355,7 @@ jobs:
           SIM_BUTTONS = ("volume_up", "volume_down", "action")
           LOC_SCENARIOS = ("Freeway Drive", "City Run", "City Bicycle Ride")
           BAD = {"ok": False, "msg": "bad request"}
+          ORIENT = {"v": 0}  # simulator rotation in quarter turns, 0 = portrait, 1 = rotated right, 3 = rotated left
 
 
           def volume(name):
@@ -510,8 +511,25 @@ jobs:
                   return r if r is not None else {"ok": False, "msg": "Ask Siri needs the XCUITest bridge"}
               if t == "rotate":
                   r = simpod(["rotate-left" if b.get("dir") == "left" else "rotate-right"])
+                  if r["ok"]:
+                      ORIENT["v"] = (ORIENT["v"] + (-1 if b.get("dir") == "left" else 1)) % 4
                   POINTS["v"] = None
                   return r
+              if t == "orient":
+                  try:
+                      want = int(b.get("v")) % 4
+                  except Exception:
+                      return BAD
+                  d = (want - ORIENT["v"]) % 4
+                  if d == 0:
+                      return {"ok": True, "msg": "ok"}
+                  for a in (["rotate-right"] * d if d <= 2 else ["rotate-left"]):
+                      r = simpod([a])
+                      if not r["ok"]:
+                          return r
+                  ORIENT["v"] = want
+                  POINTS["v"] = None
+                  return {"ok": True, "msg": "ok"}
               if t == "tz":
                   return set_tz(str(b.get("name", "")))
               if t == "shake":
@@ -668,6 +686,16 @@ jobs:
           HQ = asyncio.Queue()
 
 
+          def native_fail():
+              # Called when the native idb client misbehaves. After a few failures in a row we drop
+              # the client so init_native() reconnects it (e.g. after SpringBoard or the companion restarts).
+              NATIVE["fails"] = NATIVE.get("fails", 0) + 1
+              if NATIVE["fails"] >= 3:
+                  NATIVE["fails"] = 0
+                  NATIVE["c"] = None
+                  NATIVE["hid"] = False
+
+
           async def hid_pump():
               try:
                   from idb.common.types import HIDPress, HIDTouch, HIDDirection, Point
@@ -688,10 +716,15 @@ jobs:
                       HQ.get_nowait()
                   NATIVE["hid"] = True
                   log("live touch stream open")
+                  t0 = time.time()
                   try:
                       await NATIVE["c"].hid(gen())
                   except Exception as e:
                       log("live touch stream restarting:", repr(e))
+                      if time.time() - t0 < 5:
+                          native_fail()
+                      else:
+                          NATIVE["fails"] = 0
                   NATIVE["hid"] = False
                   await asyncio.sleep(0.5)
 
@@ -734,7 +767,16 @@ jobs:
               th.add_done_callback(BG.discard)
 
 
-          async def init_native():
+          async def connect_native(quiet=False):
+              old = NATIVE.get("stack")
+              NATIVE["c"] = None
+              NATIVE["hid"] = False
+              if old:
+                  NATIVE["stack"] = None
+                  try:
+                      await old.aclose()
+                  except Exception:
+                      pass
               try:
                   from idb.common.types import TCPAddress, HIDButtonType
                   from idb.grpc.client import Client
@@ -745,9 +787,23 @@ jobs:
                   NATIVE["c"] = client
                   NATIVE["btn"] = HIDButtonType
                   NATIVE["stack"] = stack
+                  NATIVE["fails"] = 0
                   log("native idb client connected: low-latency input enabled")
+                  return True
               except Exception as e:
-                  log("native idb client unavailable, using CLI input:", repr(e))
+                  if not quiet:
+                      log("native idb client unavailable, using CLI input:", repr(e))
+                  return False
+
+
+          async def init_native():
+              # Connects the native idb client and keeps it alive: if it gets dropped (companion or
+              # SpringBoard restarted) it is reconnected in the background instead of staying on the slow CLI path.
+              await connect_native()
+              while not STOP_EV.is_set():
+                  await asyncio.sleep(2)
+                  if NATIVE["c"] is None:
+                      await connect_native(quiet=True)
 
 
           async def handle_async(b):
@@ -785,9 +841,11 @@ jobs:
                               await c.text(str(b.get("text", "")))
                           elif t == "key":
                               await c.key(int(b["code"]))
+                          NATIVE["fails"] = 0
                           return {"ok": True, "msg": "ok"}
                       except Exception as e:
                           log("native input failed, falling back to CLI:", repr(e))
+                          native_fail()
                   return await asyncio.get_running_loop().run_in_executor(POOL, handle, b)
 
 
@@ -810,6 +868,8 @@ jobs:
 
 
           async def stream_idb():
+              # Returns: "restart" (settings changed / SpringBoard restarted), "ended" (stream died after
+              # delivering frames), "nofirst" (never produced a frame) or "stopped".
               gen = STREAM["gen"]
               cmd = [IDB, "video-stream", "--fps", STREAM["fps"], "--format", "mjpeg",
                      "--compression-quality", STREAM["quality"], "--scale-factor", STREAM["scale"], "--udid", UDID]
@@ -828,11 +888,11 @@ jobs:
                       except asyncio.TimeoutError:
                           if not got:
                               log("no video frames within 20s")
-                              return False
+                              return "nofirst"
                           continue
                       if not chunk:
                           log("idb video-stream ended")
-                          return False
+                          return "ended" if got else "nofirst"
                       buf += chunk
                       latest = None
                       while True:
@@ -855,19 +915,20 @@ jobs:
                               MODE["v"] = "idb mjpeg stream"
                               log("first frame received; streaming via idb mjpeg")
                           await publish(latest)
-                  return True
+                  return "stopped"
               finally:
                   if proc.returncode is None:
                       proc.kill()
 
 
-          async def stream_screenshots():
+          async def stream_screenshots(seconds=None):
               MODE["v"] = "screenshot fallback (slow)"
               log("using screenshot fallback")
               tmp = tempfile.gettempdir()
               raw = os.path.join(tmp, "sim_raw.jpg")
               small = os.path.join(tmp, "sim_small.jpg")
-              while not STOP_EV.is_set():
+              end = time.time() + seconds if seconds else None
+              while not STOP_EV.is_set() and (end is None or time.time() < end):
                   t = time.time()
                   p = await asyncio.create_subprocess_exec(
                       "xcrun", "simctl", "io", UDID, "screenshot", "--type=jpeg", raw,
@@ -892,15 +953,64 @@ jobs:
 
 
           async def capture():
-              if shutil.which(IDB):
-                  while await stream_idb() == "restart":
-                      log("restarting video stream with new quality")
+              # Never gives up on idb: if the video stream dies (SpringBoard restart, framebuffer reset)
+              # it is started again. Screenshots only bridge short gaps, then idb is retried.
+              if not shutil.which(IDB):
+                  log("idb not installed, falling back")
+                  await stream_screenshots()
+                  return
+              fails = 0
+              while not STOP_EV.is_set():
+                  res = await stream_idb()
                   if STOP_EV.is_set():
                       return
-                  log("idb stream unavailable, falling back")
-              else:
-                  log("idb not installed, falling back")
-              await stream_screenshots()
+                  if res == "restart":
+                      log("restarting video stream (new settings or SpringBoard restart)")
+                      await asyncio.sleep(0.3)
+                      continue
+                  if res == "ended":
+                      fails = 0
+                      log("video stream ended (SpringBoard restart?), reconnecting")
+                      await asyncio.sleep(1.0)
+                      continue
+                  fails += 1
+                  log("idb stream produced no frames (attempt %d), retrying" % fails)
+                  if fails >= 2:
+                      await stream_screenshots(seconds=12)
+                  else:
+                      await asyncio.sleep(1.5)
+
+
+          SB_RE = re.compile(r"^\s*(\d+|-)\s+\S+\s+com\.apple\.SpringBoard\s*$", re.M | re.I)
+
+
+          def springboard_pid():
+              try:
+                  r = subprocess.run(["xcrun", "simctl", "spawn", UDID, "launchctl", "list"],
+                                     capture_output=True, text=True, timeout=10)
+                  m = SB_RE.search(r.stdout)
+                  if m and m.group(1).isdigit():
+                      return int(m.group(1))
+              except Exception:
+                  pass
+              return None
+
+
+          async def springboard_watch():
+              # Notices a SpringBoard restart (new pid) and restarts the video stream right away,
+              # so a frozen stream does not have to wait for idb to notice by itself.
+              last = None
+              while not STOP_EV.is_set():
+                  await asyncio.sleep(5)
+                  pid = await asyncio.to_thread(springboard_pid)
+                  if pid is None:
+                      continue
+                  if last is not None and pid != last:
+                      log("SpringBoard restarted (pid %s -> %s), restarting the video stream" % (last, pid))
+                      POINTS["v"] = None
+                      await asyncio.sleep(1.5)
+                      STREAM["gen"] += 1
+                  last = pid
 
 
           def authed(request):
@@ -932,6 +1042,9 @@ jobs:
           async def sender(ws, st):
               last = 0
               while not ws.closed:
+                  if st.get("paused"):
+                      await asyncio.sleep(0.25)
+                      continue
                   while st["inflight"] >= WINDOW and not ws.closed:
                       try:
                           await asyncio.wait_for(st["ack"].wait(), 3)
@@ -977,6 +1090,11 @@ jobs:
                       t = b.get("t")
                       if t == "ack":
                           st["inflight"] = max(0, st["inflight"] - 1)
+                          st["ack"].set()
+                          continue
+                      if t == "pause":
+                          st["paused"] = bool(b.get("on"))
+                          st["inflight"] = 0
                           st["ack"].set()
                           continue
                       if t == "stream":
@@ -1061,7 +1179,7 @@ jobs:
                       loop.call_soon_threadsafe(audio_broadcast, raw)
 
                   stream = sd.RawInputStream(device=idx, samplerate=src_rate, channels=src_ch,
-                                             dtype="int16", blocksize=src_rate // 50, callback=cb)
+                                             dtype="int16", blocksize=src_rate // 25, callback=cb)
                   stream.start()
                   AUDIO.update(ok=True, ch=out_ch, stream=stream)
                   log("audio: %s %d Hz x%d -> %d Hz x%d PCM" % (info["name"], src_rate, src_ch, AUDIO_RATE, out_ch))
@@ -1075,7 +1193,7 @@ jobs:
               ws = web.WebSocketResponse(heartbeat=20, compress=False)
               await ws.prepare(request)
               await ws.send_json({"t": "fmt", "ok": AUDIO["ok"], "rate": AUDIO_RATE, "ch": AUDIO["ch"]})
-              q = asyncio.Queue(maxsize=25)
+              q = asyncio.Queue(maxsize=12)
               AUDIO_CLIENTS.add(q)
 
               async def pump():
@@ -1330,6 +1448,10 @@ jobs:
 
           PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
           <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+          <meta name="apple-mobile-web-app-capable" content="yes">
+          <meta name="mobile-web-app-capable" content="yes">
+          <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+          <meta name="theme-color" content="#000000">
           <title>iOS Simulator</title>
           <style>
           :root{color-scheme:dark;--bg:#0d0f14;--card:#151922;--inner:#10131a;--line:#252b3b;--text:#e8eaf0;--muted:#8a94aa;--accent:#4c8dff;--danger:#ff6b6b;--ok:#3ddc84}
@@ -1338,7 +1460,7 @@ jobs:
           body{background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,system-ui,"Segoe UI",sans-serif;
                padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
           #app{max-width:1080px;margin:0 auto;padding:14px 16px 28px;display:flex;flex-direction:column;gap:16px}
-          #top{display:flex;align-items:center;gap:10px}
+          #top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
           #top .grow{flex:1}
           .dot{width:9px;height:9px;border-radius:50%;background:#c9a227}
           .dot.ok{background:var(--ok)}
@@ -1404,11 +1526,26 @@ jobs:
             #stage{position:static}
             .pane{max-height:none}
           }
+          /* Stream-only modes: html.fs = browser Fullscreen API, html.fill = page-fill (works on iPhone, leave it by refreshing) */
+          #cv{will-change:transform}
+          html.fs,html.fill{background:#000}
+          html.fs body,html.fill body{background:#000;padding:0;overflow:hidden;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+          html.fill body{position:fixed;top:0;left:0;width:100%;height:100%}
+          html.fs #top,html.fill #top,html.fs #panel,html.fill #panel,html.fs #dock,html.fill #dock{display:none}
+          html.fs #app,html.fill #app{padding:0;max-width:none;gap:0}
+          html.fs main,html.fill main{display:block}
+          html.fs #stage,html.fill #stage{position:fixed;top:0;left:0;width:100vw;height:100vh;height:100dvh;margin:0;gap:0;justify-content:center;align-items:center;background:#000;z-index:50}
+          html.fs #bezel,html.fill #bezel{padding:0;border-radius:0;box-shadow:none;background:none}
+          html.fs #scr,html.fill #scr{border-radius:0;overflow:visible;background:none;touch-action:none}
+          html.fs #cv,html.fill #cv{max-width:none;max-height:none}
           </style></head><body>
           <div id="app">
             <header id="top">
               <span class="dot" id="dot"></span><span id="conn">Connecting</span><span id="fps"></span>
               <span class="grow"></span>
+              <button class="chip" id="oribtn" onclick="toggleOri()" style="display:none">Tilt off</button>
+              <button class="chip" id="fsbtn" onclick="goFS()">Fullscreen</button>
+              <button class="chip" id="fillbtn" onclick="goFill()">Page fill</button>
               <button class="chip" id="abtn" onclick="toggleAudio()">Sound</button>
               <button class="chip" id="mbtn" onclick="toggleMic()">Mic off</button>
             </header>
@@ -1574,7 +1711,7 @@ jobs:
                     <label class="f">Quality <b id="st_quality_v">0.6</b></label>
                     <input id="st_quality" type="range" min="0.2" max="1" step="0.05" value="0.6" oninput="sbv(this)">
                     <button class="primary" onclick="applyStream()">Apply</button>
-                    <small>Lower values are faster but blurrier.</small>
+                    <small>Lower values are faster but blurrier. The top bar shows live fps and KB/s so you can see if the link is the limit.</small>
                   </div>
                   <div class="card"><h3>Capture</h3>
                     <button onclick="location.href='/shot.png'">Save screenshot</button>
@@ -1598,7 +1735,7 @@ jobs:
           const ctx=cv.getContext('2d',{alpha:false,desynchronized:true});
           const tt=document.getElementById('toast'),fpsEl=document.getElementById('fps');
           function val(i){return document.getElementById(i).value}
-          let unread=0;
+          let unread=0,mode=null,rx=0;
           function toast(m){
             const box=document.getElementById('clog');if(!box)return;
             const d=new Date(),p=n=>String(n).padStart(2,'0');
@@ -1618,13 +1755,15 @@ jobs:
           function sendText(){post('/text',{text:val('txt')});document.getElementById('txt').value=''}
 
           let pending=null,busy=false,frames=0,lastT=performance.now();
+          const BMOPT={premultiplyAlpha:'none',colorSpaceConversion:'none'};
           async function drain(){
             busy=true;
             while(pending){
               const b=pending;pending=null;
               try{
-                const bm=await createImageBitmap(b);
-                if(cv.width!==bm.width||cv.height!==bm.height){cv.width=bm.width;cv.height=bm.height}
+                let bm;
+                try{bm=await createImageBitmap(b,BMOPT)}catch(e){bm=await createImageBitmap(b)}
+                if(cv.width!==bm.width||cv.height!==bm.height){cv.width=bm.width;cv.height=bm.height;fit()}
                 ctx.drawImage(bm,0,0);bm.close();
                 frames++;
               }catch(e){}
@@ -1632,12 +1771,12 @@ jobs:
             }
             busy=false;
           }
-          setInterval(()=>{const n=performance.now();fpsEl.textContent=(frames*1000/(n-lastT)).toFixed(1)+' fps';frames=0;lastT=n},1000);
+          setInterval(()=>{const n=performance.now();if(!mode&&!document.hidden)fpsEl.textContent=(frames*1000/(n-lastT)).toFixed(1)+' fps · '+Math.round(rx/1024*1000/(n-lastT))+' KB/s';rx=0;frames=0;lastT=n},1000);
 
           function connect(){
             if(stopped||(ws&&ws.readyState<=1))return;
             ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
-            ws.onopen=()=>{retry=0;setConn(true);toast('Connected');lastTz='';setTimeout(clockSync,300)};
+            ws.onopen=()=>{retry=0;setConn(true);toast('Connected');lastTz='';setTimeout(clockSync,300);if(document.hidden)ws.send('{"t":"pause","on":true}')};
             ws.onmessage=e=>{
               if(typeof e.data==='string'){
                 const j=JSON.parse(e.data);
@@ -1646,7 +1785,7 @@ jobs:
                 return;
               }
               if(pending)ack();
-              pending=e.data;
+              rx+=e.data.size||0;pending=e.data;
               if(!busy)drain();
             };
             ws.onclose=()=>{
@@ -1656,20 +1795,51 @@ jobs:
             };
           }
           connect();
-          document.addEventListener('visibilitychange',()=>{if(!document.hidden)connect()});
+          document.addEventListener('visibilitychange',()=>{if(!document.hidden)connect();if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'pause',on:document.hidden}))});
           window.addEventListener('online',connect);
 
-          let actx=null,aws=null,anext=0,arate=24000,ach=1,aon=false,gnode=null,volv=1;
+          let actx=null,aws=null,anext=0,arate=24000,ach=1,aon=false,gnode=null,pnode=null,volv=1;
           const abtn=document.getElementById('abtn');
           function setABtn(){abtn.textContent=aon?'Sound on':'Sound off';abtn.classList.toggle('on',aon)}
           function setVol(v){volv=v/100;if(gnode)gnode.gain.value=volv}
           function toggleAudio(){aon?audioOff():audioOn()}
-          function audioOn(){
-            actx=actx||new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});
+          // Playback runs in an AudioWorklet ring buffer: no per-chunk AudioBuffer/node allocations on the main thread.
+          const PLAY_WORKLET=`class Q extends AudioWorkletProcessor{
+          constructor(){super();this.cap=0;this.L=null;this.R=null;this.w=0;this.rp=0;this.step=0.5;this.ch=1;this.on=false;this.prime=0;
+          this.port.onmessage=e=>{const d=e.data;
+          if(d.fmt){this.ch=d.fmt.ch;this.cap=Math.ceil(d.fmt.rate*1.5);this.L=new Float32Array(this.cap);this.R=new Float32Array(this.cap);this.w=0;this.rp=0;this.on=false;this.step=d.fmt.rate/sampleRate;this.prime=Math.ceil(d.fmt.rate*0.07);return}
+          if(d.flush){this.w=0;this.rp=0;this.on=false;return}
+          if(!this.L)return;
+          const i16=new Int16Array(d),ch=this.ch,n=Math.floor(i16.length/ch);
+          for(let i=0;i<n;i++){const k=(this.w+i)%this.cap;this.L[k]=i16[i*ch]/32768;this.R[k]=ch>1?i16[i*ch+1]/32768:this.L[k]}
+          this.w+=n;
+          if(this.w-this.rp>this.cap*0.6)this.rp=this.w-this.prime}}
+          process(_,o){const out=o[0],a=out[0],b=out[1]||a;
+          if(!this.L)return true;
+          if(!this.on){if(this.w-this.rp<this.prime)return true;this.on=true}
+          for(let i=0;i<a.length;i++){
+          if(this.w-this.rp<2){this.on=false;break}
+          const p=this.rp,j=Math.floor(p),f=p-j,k=j%this.cap,k2=(j+1)%this.cap;
+          a[i]=this.L[k]*(1-f)+this.L[k2]*f;b[i]=this.R[k]*(1-f)+this.R[k2]*f;
+          this.rp+=this.step}
+          return true}}
+          registerProcessor('pcmplay',Q)`;
+          async function audioOn(){
+            if(aon)return;
+            aon=true;setABtn();
+            actx=actx||new (window.AudioContext||window.webkitAudioContext)({latencyHint:'balanced'});
             if(!gnode){gnode=actx.createGain();gnode.gain.value=volv;gnode.connect(actx.destination)}
-            actx.resume();aon=true;setABtn();aconnect();
+            if(!pnode&&actx.audioWorklet&&window.AudioWorkletNode){
+              try{
+                await actx.audioWorklet.addModule(URL.createObjectURL(new Blob([PLAY_WORKLET],{type:'application/javascript'})));
+                pnode=new AudioWorkletNode(actx,'pcmplay',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2]});
+                pnode.connect(gnode);
+              }catch(e){pnode=null;toast('audio worklet unavailable, using fallback')}
+            }
+            actx.resume();
+            if(aon)aconnect();
           }
-          function audioOff(){aon=false;if(aws){try{aws.close()}catch(e){}}aws=null;setABtn()}
+          function audioOff(){aon=false;if(aws){try{aws.close()}catch(e){}}aws=null;if(pnode)pnode.port.postMessage({flush:true});setABtn()}
           function aconnect(){
             if(!aon||stopped)return;
             aws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/wsa');
@@ -1677,7 +1847,7 @@ jobs:
             aws.onmessage=e=>{
               if(typeof e.data==='string'){
                 const j=JSON.parse(e.data);
-                if(j.t==='fmt'){arate=j.rate;ach=j.ch;if(!j.ok){toast('audio not available on server');audioOff()}}
+                if(j.t==='fmt'){arate=j.rate;ach=j.ch;if(pnode)pnode.port.postMessage({fmt:{rate:arate,ch:ach}});if(!j.ok){toast('audio not available on server');audioOff()}}
                 return;
               }
               play(e.data);
@@ -1686,6 +1856,7 @@ jobs:
           }
           function play(buf){
             if(!actx||buf.byteLength<2)return;
+            if(pnode){pnode.port.postMessage(buf,[buf]);return}
             const i16=new Int16Array(buf,0,Math.floor(buf.byteLength/2)),n=Math.floor(i16.length/ach);
             if(!n)return;
             const ab=actx.createBuffer(ach,n,arate);
@@ -1913,6 +2084,100 @@ jobs:
             post('/installurl',{url:u,launch:$('launchafter').checked});
           }
 
+          // ---- Stream-only modes ----
+          // fs   : real browser Fullscreen API (desktop, Android, iPad). Esc / system gesture leaves it.
+          // fill : "page fill" for iPhone (no Fullscreen API there). Only stream + touch remain, and there is
+          //        no way out except refreshing the page.
+          const stageEl=$('stage'),rootEl=document.documentElement;
+          let wl=null;
+          async function keepAwake(){try{if(navigator.wakeLock)wl=await navigator.wakeLock.request('screen')}catch(e){}}
+          document.addEventListener('visibilitychange',()=>{if(mode&&!document.hidden)keepAwake()});
+          function fit(){
+            if(!mode){cv.style.width='';cv.style.height='';return}
+            const W=stageEl.clientWidth,H=stageEl.clientHeight;
+            if(!W||!H||!cv.width||!cv.height)return;
+            const s=Math.min(W/cv.width,H/cv.height);
+            cv.style.width=Math.floor(cv.width*s)+'px';cv.style.height=Math.floor(cv.height*s)+'px';
+          }
+          new ResizeObserver(fit).observe(stageEl);
+          addEventListener('resize',fit);
+          addEventListener('orientationchange',()=>setTimeout(fit,250));
+          function setMode(m){
+            mode=m;
+            rootEl.classList.toggle('fs',m==='fs');
+            rootEl.classList.toggle('fill',m==='fill');
+            fit();
+            if(m){keepAwake();scrollTo(0,0)}
+          }
+          const canFS=!!(rootEl.requestFullscreen||rootEl.webkitRequestFullscreen);
+          if(!canFS)$('fsbtn').style.display='none';
+          async function goFS(){
+            try{
+              if(rootEl.requestFullscreen)await rootEl.requestFullscreen({navigationUI:'hide'});
+              else await rootEl.webkitRequestFullscreen();
+              if(actx&&actx.state==='suspended')actx.resume();
+            }catch(e){toast('fullscreen: '+(e&&e.message||e))}
+          }
+          function fsChange(){
+            if(mode==='fill')return;
+            setMode((document.fullscreenElement||document.webkitFullscreenElement)?'fs':null);
+          }
+          document.addEventListener('fullscreenchange',fsChange);
+          document.addEventListener('webkitfullscreenchange',fsChange);
+          function goFill(){
+            if(mode==='fill')return;
+            setMode('fill');
+            if(actx&&actx.state==='suspended')actx.resume();
+          }
+          document.addEventListener('touchmove',e=>{if(mode)e.preventDefault()},{passive:false});
+          document.addEventListener('contextmenu',e=>{if(mode)e.preventDefault()});
+          document.addEventListener('gesturestart',e=>{if(mode)e.preventDefault()});
+
+          // ---- Device orientation: the simulator follows how you hold your phone ----
+          // Android/desktop browsers start it immediately; iOS only allows the permission prompt from a tap,
+          // so there it appears on your first touch. Flip ORI_FLIP if it rotates the wrong way.
+          const ORI_FLIP=false,hasOri=('DeviceOrientationEvent' in window)&&matchMedia('(pointer:coarse)').matches;
+          let oriOn=false,oriWant=0,oriSent=0,oriTimer=null,oriAsked=false;
+          function setOriBtn(){const b=$('oribtn');b.textContent=oriOn?'Tilt on':'Tilt off';b.classList.toggle('on',oriOn)}
+          function oriHandle(e){
+            const b=e.beta,g=e.gamma;
+            if(b==null||g==null)return;
+            let w=oriWant;
+            if(Math.abs(g)>55&&Math.abs(b)<45)w=g>0?1:3;
+            else if(Math.abs(b)>50&&Math.abs(g)<35)w=0;
+            if(w===oriWant)return;
+            oriWant=w;clearTimeout(oriTimer);
+            oriTimer=setTimeout(()=>{if(oriWant!==oriSent){oriSent=oriWant;post('/orient',{v:ORI_FLIP?(4-oriWant)%4:oriWant})}},500);
+          }
+          async function oriStart(gesture){
+            if(oriOn||!hasOri)return;
+            try{
+              const D=window.DeviceOrientationEvent;
+              if(typeof D.requestPermission==='function'){
+                oriAsked=true;
+                const r=await D.requestPermission();
+                if(r!=='granted'){toast('orientation permission denied');return}
+              }
+              addEventListener('deviceorientation',oriHandle);
+              oriOn=true;setOriBtn();toast('device orientation on');
+            }catch(e){
+              if(gesture)toast('orientation: '+(e&&e.message||e));
+              else if(!oriAsked&&typeof window.DeviceOrientationEvent.requestPermission==='function')oriAsked=false;
+            }
+          }
+          function toggleOri(){
+            if(oriOn){removeEventListener('deviceorientation',oriHandle);oriOn=false;setOriBtn();return}
+            oriStart(true);
+          }
+          if(hasOri){
+            $('oribtn').style.display='';
+            oriStart(false);
+            if(typeof window.DeviceOrientationEvent.requestPermission==='function'){
+              const first=()=>{if(!oriOn&&!oriAsked)oriStart(true);if(oriOn||oriAsked)['touchend','pointerup'].forEach(ev=>document.removeEventListener(ev,first))};
+              ['touchend','pointerup'].forEach(ev=>document.addEventListener(ev,first));
+            }
+          }
+
           loadApps();
           </script></body></html>'''
 
@@ -1926,6 +2191,7 @@ jobs:
               asyncio.create_task(capture())
               asyncio.create_task(init_native())
               asyncio.create_task(hid_pump())
+              asyncio.create_task(springboard_watch())
               _loop = asyncio.get_running_loop()
               _loop.run_in_executor(POOL, audio_boot, _loop)
               _loop.run_in_executor(POOL, lambda: _warm())
@@ -1963,7 +2229,8 @@ jobs:
           fi
 
           if command -v idb_companion >/dev/null && command -v idb >/dev/null; then
-            nohup idb_companion --udid "$UDID" --grpc-port "$GRPC_PORT" > companion.log 2>&1 &
+            # Supervised: if the companion ever exits (SpringBoard restart, framebuffer reset) it comes straight back.
+            nohup bash -c 'while true; do idb_companion --udid "$UDID" --grpc-port "$GRPC_PORT" >> companion.log 2>&1; echo "idb_companion exited, restarting" >> companion.log; sleep 1; done' > /dev/null 2>&1 &
             sleep 6
             idb connect localhost "$GRPC_PORT" || true
             echo "--- idb self-test (failures here mean touch input won't work) ---"
