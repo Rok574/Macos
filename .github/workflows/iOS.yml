@@ -271,11 +271,7 @@ jobs:
           final class ButtonBridge: XCTestCase {
               @MainActor
               func pressHardwareButton(_ button: XCUIDevice.Button) -> String {
-                  let device = XCUIDevice.shared
-                  guard device.hasHardwareButton(button) else {
-                      return "unsupported: this simulator device has no such hardware button"
-                  }
-                  device.press(button)
+                  XCUIDevice.shared.press(button)
                   return "ok"
               }
 
@@ -881,6 +877,13 @@ jobs:
                   return await asyncio.get_running_loop().run_in_executor(POOL, install_url, b)
               if t == "button" and b.get("name") == "SIRI":
                   threading.Thread(target=siri_diag, daemon=True).start()
+              if t == "button" and b.get("name") == "HOME":
+                  # idb's HOME press is unreliable on recent iOS runtimes (it reports success but does nothing),
+                  # so use the XCUITest bridge first and only fall back to idb if the bridge is unavailable.
+                  r = await asyncio.get_running_loop().run_in_executor(POOL, bridge, "home", 6.0)
+                  log("[home] native XCTest ->", r)
+                  if r is not None and r.get("ok"):
+                      return r
               async with INPUT_LOCK:
                   c = NATIVE["c"]
                   if c and t in ("tap", "swipe", "button", "text", "key"):
@@ -929,6 +932,21 @@ jobs:
                   pass
 
 
+          async def shoot_once():
+              # idb's video stream only emits frames when the screen changes, so on a still screen we
+              # publish one screenshot to keep the page alive while we keep waiting for the first frame.
+              p = os.path.join(tempfile.gettempdir(), "sim_once.jpg")
+              pr = await asyncio.create_subprocess_exec(
+                  "xcrun", "simctl", "io", UDID, "screenshot", "--type=jpeg", p,
+                  stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+              if await pr.wait() == 0:
+                  try:
+                      data = await asyncio.to_thread(lambda: open(p, "rb").read())
+                      await publish(data)
+                  except Exception as e:
+                      log("screenshot publish failed:", repr(e))
+
+
           async def stream_idb():
               # Returns: "restart" (settings changed / SpringBoard restarted), "ended" (stream died after
               # delivering frames), "nofirst" (never produced a frame) or "stopped".
@@ -941,6 +959,7 @@ jobs:
               asyncio.create_task(log_stderr(proc))
               buf = bytearray()
               got = False
+              waited = 0
               try:
                   while not STOP_EV.is_set():
                       if STREAM["gen"] != gen:
@@ -949,8 +968,11 @@ jobs:
                           chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=(1 if got else 8))
                       except asyncio.TimeoutError:
                           if not got:
-                              log("no video frames within 8s; switching to simulator screenshot capture")
-                              return "nofirst"
+                              waited += 8
+                              if waited >= 40:
+                                  log("no video frames within 40s; switching to simulator screenshot capture")
+                                  return "nofirst"
+                              await shoot_once()
                           continue
                       if not chunk:
                           log("idb video-stream ended")
@@ -2546,7 +2568,7 @@ jobs:
             end repeat
           end tell
           AS
-            sleep 2
+            sleep 6
           done
           SH
           chmod +x allow.sh
