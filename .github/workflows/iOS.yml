@@ -41,23 +41,42 @@ jobs:
           if [ -n "$XC" ]; then sudo xcode-select -s "$XC/Contents/Developer"; fi
           xcodebuild -version
 
+      - name: Restore dependency and build caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            ~/.cache/pip
+            ~/.pub-cache
+            /tmp/simforge-src
+            /tmp/simforge-build
+          key: macos-26-${{ runner.arch }}-simulator-deps-v4
+          restore-keys: |
+            macos-26-${{ runner.arch }}-simulator-deps-
+
       - name: Build best-effort IPA simulator converter
         continue-on-error: true
         run: |
           set +e
-          git clone --depth 1 https://github.com/EthanArbuckle/simforge.git /tmp/simforge-src
+          if [ ! -d /tmp/simforge-src/.git ]; then
+            rm -rf /tmp/simforge-src
+            git clone --depth 1 https://github.com/EthanArbuckle/simforge.git /tmp/simforge-src
+          fi
           if [ -d /tmp/simforge-src/simforge.xcodeproj ]; then
-            SCHEME=$(xcodebuild -list -json -project /tmp/simforge-src/simforge.xcodeproj 2>/dev/null | jq -r '.project.schemes[0] // empty')
-            if [ -n "$SCHEME" ]; then
-              xcodebuild -project /tmp/simforge-src/simforge.xcodeproj -scheme "$SCHEME" -configuration Release -derivedDataPath /tmp/simforge-build CODE_SIGNING_ALLOWED=NO build
-              BIN=$(find /tmp/simforge-build/Build/Products/Release -type f -name simforge -perm -111 2>/dev/null | head -1)
-              if [ -n "$BIN" ]; then
-                cp "$BIN" /usr/local/bin/simforge
-                chmod +x /usr/local/bin/simforge
-                echo "SIMFORGE_PATH=/usr/local/bin/simforge" >> "$GITHUB_ENV"
-                echo "simforge converter ready"
-                exit 0
+            BIN=$(find /tmp/simforge-build/Build/Products/Release -type f -name simforge -perm -111 2>/dev/null | head -1)
+            if [ -z "$BIN" ]; then
+              SCHEME=$(xcodebuild -list -json -project /tmp/simforge-src/simforge.xcodeproj 2>/dev/null | jq -r '.project.schemes[0] // empty')
+              if [ -n "$SCHEME" ]; then
+                xcodebuild -project /tmp/simforge-src/simforge.xcodeproj -scheme "$SCHEME" -configuration Release -derivedDataPath /tmp/simforge-build CODE_SIGNING_ALLOWED=NO build
+                BIN=$(find /tmp/simforge-build/Build/Products/Release -type f -name simforge -perm -111 2>/dev/null | head -1)
               fi
+            fi
+            if [ -n "$BIN" ]; then
+              cp "$BIN" /usr/local/bin/simforge
+              chmod +x /usr/local/bin/simforge
+              echo "SIMFORGE_PATH=/usr/local/bin/simforge" >> "$GITHUB_ENV"
+              echo "simforge converter ready"
+              exit 0
             fi
           fi
           echo "SIMFORGE_PATH=" >> "$GITHUB_ENV"
@@ -77,8 +96,9 @@ jobs:
         if: ${{ inputs.audio }}
         continue-on-error: true
         run: |
-          brew install switchaudio-osx
-          brew install --cask blackhole-2ch blackhole-16ch
+          command -v SwitchAudioSource >/dev/null || brew install switchaudio-osx
+          brew list --cask blackhole-2ch >/dev/null 2>&1 || brew install --cask blackhole-2ch
+          brew list --cask blackhole-16ch >/dev/null 2>&1 || brew install --cask blackhole-16ch
           sudo killall coreaudiod || true
           for i in $(seq 1 20); do
             SwitchAudioSource -a -t output | grep -q "BlackHole 2ch" && \
@@ -161,22 +181,26 @@ jobs:
 
       - name: Install cloudflared (tunnel)
         run: |
-          brew install cloudflared
+          command -v cloudflared >/dev/null || brew install cloudflared
           cloudflared --version
 
       - name: Install idb (video + touch input)
         continue-on-error: true
         run: |
-          brew tap facebook/fb
-          brew trust facebook/fb || true
-          brew install idb-companion
-          pip install fb-idb
+          if ! command -v idb_companion >/dev/null; then
+            brew tap facebook/fb
+            brew trust facebook/fb || true
+            brew install idb-companion
+          fi
+          python -m pip install --disable-pip-version-check fb-idb
           idb --help | head -3
 
       - name: Install aiohttp (+ sounddevice for audio)
         run: |
-          pip install aiohttp
-          pip install sounddevice || echo "sounddevice failed: audio disabled"
+          python -m pip install --disable-pip-version-check aiohttp sounddevice || {
+            python -m pip install --disable-pip-version-check aiohttp
+            echo "sounddevice failed: audio disabled"
+          }
 
       - name: Install simpod (rotation support)
         continue-on-error: true
@@ -186,14 +210,16 @@ jobs:
             brew trust dart-lang/dart || true
             brew install dart
           fi
-          dart pub global activate simpod
+          if [ ! -x "$HOME/.pub-cache/bin/simpod" ]; then
+            dart pub global activate simpod
+          fi
           echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
           "$HOME/.pub-cache/bin/simpod" --help || true
 
       - name: Build XCUITest button bridge (Action button, volume, Ask Siri)
         continue-on-error: true
         run: |
-          brew install xcodegen
+          command -v xcodegen >/dev/null || brew install xcodegen
           mkdir -p bridge/Host bridge/BridgeUITests
           cd bridge
           cat > project.yml <<'YML'
@@ -2344,10 +2370,31 @@ jobs:
           chmod +x allow.sh
           if [ "$AUDIO" = "true" ]; then nohup ./allow.sh > /dev/null 2>&1 & fi
 
-          nohup python3 server.py > server.log 2>&1 &
+          python3 -u server.py > server.log 2>&1 &
           SERVER_PID=$!
-          sleep 4
-          curl -fsS "http://127.0.0.1:$PORT/?key=$TOKEN" -o /dev/null || { cat server.log; exit 1; }
+          SERVER_READY=0
+          for i in $(seq 1 30); do
+            if curl --connect-timeout 2 -fsS "http://127.0.0.1:$PORT/?key=$TOKEN" -o /dev/null; then
+              SERVER_READY=1
+              break
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "Web server exited before becoming ready (pid $SERVER_PID)"
+              break
+            fi
+            sleep 1
+          done
+          if [ "$SERVER_READY" != "1" ]; then
+            echo "Web server did not become ready on 127.0.0.1:$PORT"
+            echo "--- server.log ---"
+            cat server.log || true
+            echo "--- process ---"
+            ps -p "$SERVER_PID" -o pid,stat,command || true
+            echo "--- listening ports ---"
+            lsof -nP -iTCP -sTCP:LISTEN || true
+            exit 1
+          fi
+          echo "Web server ready on port $PORT (pid $SERVER_PID)"
           tail -n +1 -f server.log &
 
           nohup cloudflared tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 > cf.log 2>&1 &
