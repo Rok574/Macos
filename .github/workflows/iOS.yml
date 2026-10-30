@@ -510,6 +510,53 @@ jobs:
                   log("[siri-diag] log show failed:", e)
 
 
+          def app_crash_diag(bundle, executable="", since=None):
+              since = since or (time.time() - 90)
+              roots = [os.path.expanduser("~/Library/Logs/DiagnosticReports"),
+                       os.path.expanduser("~/Library/Developer/CoreSimulator/Devices/%s/data/Library/Logs/CrashReporter" % UDID)]
+              needles = [str(bundle or "").lower(), str(executable or "").lower()]
+              found = []
+              for root in roots:
+                  try:
+                      for name in os.listdir(root):
+                          path = os.path.join(root, name)
+                          if not os.path.isfile(path) or os.path.getmtime(path) < since:
+                              continue
+                          low = name.lower()
+                          if any(n and n in low for n in needles):
+                              found.append(path)
+                  except Exception:
+                      pass
+              for path in sorted(found, key=lambda x: os.path.getmtime(x), reverse=True)[:3]:
+                  log("[app-crash-guard] crash report:", os.path.basename(path))
+                  count = 0
+                  try:
+                      with open(path, errors="replace") as f:
+                          for line in f:
+                              low = line.lower()
+                              if any(k in low for k in ("exception type", "exception codes", "termination reason", "termination description", "triggered by thread", "dyld message", "library not loaded", "code signature", "crashed thread", "faulting thread")):
+                                  log("[app-crash-guard]", line.strip()[:320])
+                                  count += 1
+                                  if count >= 18:
+                                      break
+                  except Exception as e:
+                      log("[app-crash-guard] could not read report:", e)
+              if not found:
+                  log("[app-crash-guard] no matching crash report found yet for", bundle)
+              try:
+                  predicate = 'eventMessage CONTAINS[c] "%s" OR process == "%s"' % (str(bundle).replace('"', ''), str(executable).replace('"', ''))
+                  r = subprocess.run(["xcrun", "simctl", "spawn", UDID, "log", "show", "--last", "45s", "--style", "compact", "--predicate", predicate], capture_output=True, text=True, timeout=45)
+                  count = 0
+                  for line in r.stdout.splitlines():
+                      if any(k in line.lower() for k in ("dyld", "crash", "fault", "termination", "not found", "denied", "incompatible")):
+                          log("[app-crash-guard]", line[:300])
+                          count += 1
+                          if count >= 20:
+                              break
+              except Exception as e:
+                  log("[app-crash-guard] simulator log query failed:", e)
+
+
           def action_button():
               r = bridge("action", wait=8.0)
               log("[action] native XCTest ->", r)
@@ -830,13 +877,6 @@ jobs:
 
           async def handle_async(b):
               t = b.get("t")
-              if t == "button" and b.get("name") == "HOME":
-                  hr = await asyncio.get_running_loop().run_in_executor(POOL, bridge, "home", 4.0)
-                  log("[home] bridge ->", hr)
-                  if hr is not None and hr["ok"]:
-                      return hr
-                  b = {"t": "swipe", "x1": 0.5, "y1": 0.999, "x2": 0.5, "y2": 0.5, "dur": 0.15}
-                  t = "swipe"
               if t == "installurl":
                   return await asyncio.get_running_loop().run_in_executor(POOL, install_url, b)
               if t == "button" and b.get("name") == "SIRI":
@@ -906,10 +946,10 @@ jobs:
                       if STREAM["gen"] != gen:
                           return "restart"
                       try:
-                          chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=(1 if got else 20))
+                          chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=(1 if got else 8))
                       except asyncio.TimeoutError:
                           if not got:
-                              log("no video frames within 20s")
+                              log("no video frames within 8s; switching to simulator screenshot capture")
                               return "nofirst"
                           continue
                       if not chunk:
@@ -955,7 +995,8 @@ jobs:
                   p = await asyncio.create_subprocess_exec(
                       "xcrun", "simctl", "io", UDID, "screenshot", "--type=jpeg", raw,
                       stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                  if await p.wait() == 0:
+                  rc = await p.wait()
+                  if rc == 0 and os.path.exists(raw):
                       src = raw
                       if SCALE_H > 0:
                           s = await asyncio.create_subprocess_exec(
@@ -967,8 +1008,10 @@ jobs:
                       try:
                           data = await asyncio.to_thread(lambda: open(src, "rb").read())
                           await publish(data)
-                      except Exception:
-                          pass
+                      except Exception as e:
+                          log("screenshot publish failed:", repr(e))
+                  else:
+                      log("simctl screenshot failed with exit code", rc)
                   dt = time.time() - t
                   if dt < 0.05:
                       await asyncio.sleep(0.05 - dt)
@@ -988,19 +1031,20 @@ jobs:
                       return
                   if res == "restart":
                       log("restarting video stream (new settings or SpringBoard restart)")
-                      await asyncio.sleep(0.3)
+                      await asyncio.sleep(0.2)
                       continue
                   if res == "ended":
                       fails = 0
                       log("video stream ended (SpringBoard restart?), reconnecting")
-                      await asyncio.sleep(1.0)
+                      await asyncio.sleep(0.5)
                       continue
                   fails += 1
-                  log("idb stream produced no frames (attempt %d), retrying" % fails)
+                  log("idb stream produced no frames (attempt %d); keeping idb as primary capture" % fails)
                   if fails >= 2:
-                      await stream_screenshots(seconds=12)
+                      await stream_screenshots(seconds=3)
+                      fails = 0
                   else:
-                      await asyncio.sleep(1.5)
+                      await asyncio.sleep(0.5)
 
 
           SB_RE = re.compile(r"^\s*(\d+|-)\s+\S+\s+com\.apple\.SpringBoard\s*$", re.M | re.I)
@@ -1356,11 +1400,22 @@ jobs:
 
 
           def find_app(root):
+              preferred = os.path.join(root, "Payload")
+              if os.path.isdir(preferred):
+                  direct = sorted(os.path.join(preferred, x) for x in os.listdir(preferred)
+                                  if x.endswith(".app") and os.path.isdir(os.path.join(preferred, x)))
+                  if direct:
+                      return direct[0]
+              found = []
               for dp, dns, _ in os.walk(root):
-                  for d in sorted(dns):
+                  dns[:] = sorted(d for d in dns if not d.endswith((".framework", ".appex", ".app"))) + sorted(
+                      d for d in dns if d.endswith(".app"))
+                  for d in dns:
                       if d.endswith(".app"):
-                          return os.path.join(dp, d)
-              return None
+                          path = os.path.join(dp, d)
+                          depth = path.count(os.sep)
+                          found.append((depth, path))
+              return min(found)[1] if found else None
 
 
           def read_bundle_id(app):
@@ -1372,17 +1427,116 @@ jobs:
                   return ""
 
 
+          def app_executable(app):
+              try:
+                  p = subprocess.run(["plutil", "-extract", "CFBundleExecutable", "raw", "-o", "-",
+                                      os.path.join(app, "Info.plist")], capture_output=True, text=True, timeout=20)
+                  name = p.stdout.strip() if p.returncode == 0 else ""
+                  path = os.path.join(app, name)
+                  return path if name and os.path.isfile(path) else ""
+              except Exception:
+                  return ""
+
+
+          def inspect_binary(path):
+              result = {"path": path, "archs": "unknown", "platform": "unknown", "encrypted": False}
+              try:
+                  a = subprocess.run(["lipo", "-archs", path], capture_output=True, text=True, timeout=15)
+                  if a.returncode == 0:
+                      result["archs"] = (a.stdout + a.stderr).strip()[:100]
+                  o = subprocess.run(["otool", "-l", path], capture_output=True, text=True, timeout=30)
+                  if o.returncode == 0:
+                      txt = o.stdout + o.stderr
+                      if re.search(r"\bplatform\s+7\b", txt):
+                          result["platform"] = "iOS Simulator"
+                      elif re.search(r"\bplatform\s+2\b", txt):
+                          result["platform"] = "iOS device"
+                      elif "LC_VERSION_MIN_IPHONEOS" in txt:
+                          result["platform"] = "legacy iOS (device or simulator unknown)"
+                      if re.search(r"\bcryptid\s+1\b", txt):
+                          result["encrypted"] = True
+              except Exception:
+                  pass
+              return result
+
+
+          def inspect_app(app):
+              info = {"bundle": read_bundle_id(app), "executable": app_executable(app),
+                      "binaries": [], "encrypted": [], "device_only": [], "simulator": [],
+                      "conversion_candidate": [], "warnings": []}
+              if not os.path.isfile(os.path.join(app, "Info.plist")):
+                  info["warnings"].append("Info.plist is missing")
+              if not info["executable"]:
+                  info["warnings"].append("CFBundleExecutable is missing or its executable file is absent")
+              candidates = []
+              for dp, _, files in os.walk(app):
+                  for name in files:
+                      path = os.path.join(dp, name)
+                      try:
+                          with open(path, "rb") as f:
+                              magic = f.read(4)
+                          if magic in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
+                                       b"\xfe\xed\xfa\xce", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+                              candidates.append(path)
+                      except Exception:
+                          pass
+              if info["executable"] and info["executable"] not in candidates:
+                  candidates.insert(0, info["executable"])
+              for path in candidates[:400]:
+                  item = inspect_binary(path)
+                  info["binaries"].append(item)
+                  if item["encrypted"]:
+                      info["encrypted"].append(os.path.relpath(path, app))
+                  rel = os.path.relpath(path, app)
+                  if item["platform"] == "iOS device":
+                      info["device_only"].append(rel)
+                  elif item["platform"] == "iOS Simulator":
+                      info["simulator"].append(rel)
+                  if item["platform"] != "iOS Simulator" and "arm64" in item["archs"]:
+                      info["conversion_candidate"].append(rel)
+              if not info["binaries"]:
+                  info["warnings"].append("No Mach-O executables or frameworks were detected")
+              if info["encrypted"]:
+                  info["warnings"].append("FairPlay-encrypted Mach-O files detected; header conversion and re-signing cannot decrypt them")
+              if info["device_only"]:
+                  info["warnings"].append("Device-platform Mach-O files detected; Simulator conversion may be required")
+              return info
+
+
           def try_simulator_conversion(app, reason):
               if not SIMFORGE or not os.path.isfile(SIMFORGE):
                   return {"ok": False, "msg": "SimForge converter is unavailable; " + reason}
-              log("Attempting Simulator conversion after", reason)
-              cr = run([SIMFORGE, "convert", app], timeout=300)
+              converted_app = app + ".simulator.app"
+              try:
+                  if os.path.exists(converted_app):
+                      shutil.rmtree(converted_app, ignore_errors=True)
+                  shutil.copytree(app, converted_app, symlinks=True)
+              except Exception as e:
+                  return {"ok": False, "msg": "could not create a safe conversion copy: " + str(e)[:140]}
+              log("Attempting isolated Simulator conversion after", reason)
+              cr = run([SIMFORGE, "convert", converted_app], timeout=900)
               if not cr["ok"]:
-                  return {"ok": False, "msg": "SimForge conversion failed: " + cr["msg"][:180]}
-              sr = run(["codesign", "--force", "--deep", "--sign", "-", app], timeout=300)
+                  shutil.rmtree(converted_app, ignore_errors=True)
+                  return {"ok": False, "msg": "SimForge conversion failed: " + cr["msg"][:220]}
+              after = inspect_app(converted_app)
+              remaining = after["conversion_candidate"]
+              log("Post-conversion audit:", len(after["binaries"]), "Mach-O files;",
+                  len(remaining), "ARM64 non-Simulator binaries remain;",
+                  len(after["encrypted"]), "encrypted binaries")
+              for item in remaining[:30]:
+                  log("[patch-audit] still needs review:", item)
+              for item in after["encrypted"][:20]:
+                  log("[patch-audit] encrypted and not repairable by conversion:", item)
+              sr = run(["codesign", "--force", "--deep", "--sign", "-", "--timestamp=none", converted_app], timeout=600)
               if not sr["ok"]:
+                  shutil.rmtree(converted_app, ignore_errors=True)
                   return {"ok": False, "msg": "converted, but ad-hoc signing failed: " + sr["msg"][:180]}
-              return {"ok": True, "msg": "converted for Simulator and ad-hoc signed"}
+              verify = run(["codesign", "--verify", "--deep", "--strict", converted_app], timeout=180)
+              if not verify["ok"]:
+                  log("[patch-audit] codesign verification warning:", verify["msg"][:220])
+              note = "converted and signed; %d ARM64 non-Simulator binaries remain" % len(remaining)
+              return {"ok": True, "msg": note, "app": converted_app,
+                      "remaining": remaining, "encrypted": after["encrypted"]}
 
 
           def install_any(path, launch):
@@ -1390,9 +1544,9 @@ jobs:
               try:
                   low = path.lower()
                   if low.endswith((".zip", ".ipa")):
-                      r = run(["ditto", "-x", "-k", path, work], timeout=300)
+                      r = run(["ditto", "-x", "-k", path, work], timeout=600)
                   elif low.endswith((".tgz", ".tar.gz")):
-                      r = run(["tar", "-xzf", path, "-C", work], timeout=300)
+                      r = run(["tar", "-xzf", path, "-C", work], timeout=600)
                   else:
                       return {"ok": False, "msg": "use a .zip, .tar.gz or .ipa that contains a Simulator .app"}
                   if not r["ok"]:
@@ -1400,52 +1554,80 @@ jobs:
                   app = find_app(work)
                   if not app:
                       return {"ok": False, "msg": "no .app found inside the archive"}
-                  bid = read_bundle_id(app)
+                  info = inspect_app(app)
+                  bid = info["bundle"]
                   if not bid or not BUNDLE_RE.match(bid):
                       return {"ok": False, "msg": "could not read a valid CFBundleIdentifier from the app"}
+                  if not info["executable"]:
+                      return {"ok": False, "msg": "app has no valid main executable; " + "; ".join(info["warnings"])}
+                  log("IPA preflight:", bid, "Mach-O files:", len(info["binaries"]),
+                      "device:", len(info["device_only"]), "simulator:", len(info["simulator"]),
+                      "encrypted:", len(info["encrypted"]))
+                  for warning in info["warnings"]:
+                      log("IPA warning:", warning)
 
-                  installed = run(["xcrun", "simctl", "install", UDID, app], timeout=300)
                   converted = False
                   conversion_note = ""
-
-                  if not installed["ok"]:
-                      conversion = try_simulator_conversion(app, "simulator installation failed")
+                  if info["conversion_candidate"]:
+                      conversion = try_simulator_conversion(
+                          app, "preflight found ARM64 binaries not identified as Simulator binaries")
                       if conversion["ok"]:
+                          app = conversion["app"]
                           converted = True
-                          installed = run(["xcrun", "simctl", "install", UDID, app], timeout=300)
                           conversion_note = " (" + conversion["msg"] + ")"
                       else:
+                          conversion_note = " (conversion not completed: " + conversion["msg"][:180] + ")"
+                  installed = run(["xcrun", "simctl", "install", UDID, app], timeout=600)
+                  if not installed["ok"] and not converted and info["conversion_candidate"]:
+                      conversion = try_simulator_conversion(app, "initial Simulator install failed: " + installed["msg"][:140])
+                      if conversion["ok"]:
+                          app = conversion["app"]
+                          converted = True
                           conversion_note = " (" + conversion["msg"] + ")"
-
+                          installed = run(["xcrun", "simctl", "install", UDID, app], timeout=600)
                   if not installed["ok"]:
-                      return {"ok": False, "msg": "install failed: " + installed["msg"][:220] + conversion_note + ". A device-only IPA may need a decrypted Simulator-compatible build."}
+                      details = installed["msg"][:180]
+                      if info["encrypted"]:
+                          details += "; encrypted executable cannot be repaired by this patcher"
+                      elif not info["conversion_candidate"]:
+                          details += "; no device-platform Mach-O was identified, so this may be a malformed archive or unsupported app bundle"
+                      return {"ok": False, "msg": "install failed: " + details + conversion_note}
 
                   run(["xcrun", "simctl", "privacy", UDID, "grant", "microphone", bid])
                   msg = "installed " + bid + conversion_note
-
                   if launch:
-                      lr = run(["xcrun", "simctl", "launch", UDID, bid], timeout=45)
-                      if not lr["ok"] and not converted:
-                          log("App installed but failed to launch; attempting Simulator conversion:", lr["msg"])
-                          conversion = try_simulator_conversion(app, "app installed but failed to launch: " + lr["msg"][:180])
+                      launch_started = time.time()
+                      lr = run(["xcrun", "simctl", "launch", UDID, bid], timeout=60)
+                      if not lr["ok"] and not converted and info["conversion_candidate"]:
+                          log("App installed but failed to launch; trying isolated Simulator conversion:", lr["msg"])
+                          conversion = try_simulator_conversion(app, "launch failed: " + lr["msg"][:160])
                           if conversion["ok"]:
-                              stop = run(["xcrun", "simctl", "terminate", UDID, bid], timeout=20)
+                              run(["xcrun", "simctl", "terminate", UDID, bid], timeout=20)
                               run(["xcrun", "simctl", "uninstall", UDID, bid], timeout=60)
-                              reinstall = run(["xcrun", "simctl", "install", UDID, app], timeout=300)
+                              reinstall = run(["xcrun", "simctl", "install", UDID, conversion["app"]], timeout=600)
                               if reinstall["ok"]:
+                                  app = conversion["app"]
                                   converted = True
                                   conversion_note = " (" + conversion["msg"] + ")"
-                                  lr = run(["xcrun", "simctl", "launch", UDID, bid], timeout=45)
+                                  lr = run(["xcrun", "simctl", "launch", UDID, bid], timeout=60)
                                   msg = "installed " + bid + conversion_note
                               else:
                                   lr = reinstall
-                                  conversion_note = " (conversion succeeded but reinstall failed: " + reinstall["msg"][:160] + ")"
+                                  conversion_note = " (conversion reinstall failed: " + reinstall["msg"][:140] + ")"
                           else:
-                              conversion_note = " (launch-triggered conversion unavailable: " + conversion["msg"][:180] + ")"
+                              conversion_note = " (conversion unavailable: " + conversion["msg"][:160] + ")"
                       if not lr["ok"]:
-                          msg += " (launch failed: " + lr["msg"][:220] + ")"
+                          msg += " (launch failed: " + lr["msg"][:180] + ")"
+                          app_crash_diag(bid, os.path.basename(info["executable"]), launch_started)
+                          if info["encrypted"]:
+                              msg += " (encrypted code detected; use a legally obtained decrypted build)"
                       else:
-                          msg += " (launched)"
+                          time.sleep(3)
+                          log("[app-crash-guard] post-launch stability check for", bid)
+                          app_crash_diag(bid, os.path.basename(info["executable"]), launch_started)
+                          msg += " (launch command succeeded; post-launch crash diagnostics checked)"
+                  if info["warnings"]:
+                      msg += " | preflight: " + "; ".join(info["warnings"])[:220]
                   return {"ok": True, "msg": msg, "bundle": bid}
               finally:
                   shutil.rmtree(work, ignore_errors=True)
